@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -77,9 +77,13 @@ type Config struct {
 	// ActiveNetParams details the current chain we are on.
 	ActiveNetParams BitcoinNetParams
 
-	// FeeURL defines the URL for fee estimation we will use. This field is
-	// optional.
+	// Deprecated: Use Fee.URL. FeeURL defines the URL for fee estimation
+	// we will use. This field is optional.
 	FeeURL string
+
+	// Fee defines settings for the web fee estimator. This field is
+	// optional.
+	Fee *lncfg.Fee
 
 	// Dialer is a function closure that will be used to establish outbound
 	// TCP connections to Bitcoin peers in the event of a pruned block being
@@ -122,6 +126,11 @@ const (
 	// DefaultBitcoinStaticMinRelayFeeRate is the min relay fee used for
 	// static estimators.
 	DefaultBitcoinStaticMinRelayFeeRate = chainfee.FeePerKwFloor
+
+	// DefaultMinOutboundPeers is the min number of connected
+	// outbound peers the chain backend should have to maintain a
+	// healthy connection to the network.
+	DefaultMinOutboundPeers = 6
 )
 
 // PartialChainControl contains all the primary interfaces of the chain control
@@ -166,10 +175,6 @@ type PartialChainControl struct {
 
 	// MinHtlcIn is the minimum HTLC we will accept.
 	MinHtlcIn lnwire.MilliSatoshi
-
-	// ChannelConstraints is the set of default constraints that will be
-	// used for any incoming or outgoing channel reservation requests.
-	ChannelConstraints channeldb.ChannelConstraints
 }
 
 // ChainControl couples the three primary interfaces lnd utilizes for a
@@ -202,19 +207,6 @@ type ChainControl struct {
 	// Wallet is our LightningWallet that also contains the abstract Wc
 	// above. This wallet handles all of the lightning operations.
 	Wallet *lnwallet.LightningWallet
-}
-
-// GenDefaultBtcConstraints generates the default set of channel constraints
-// that are to be used when funding a Bitcoin channel.
-func GenDefaultBtcConstraints() channeldb.ChannelConstraints {
-	// We use the dust limit for the maximally sized witness program with
-	// a 40-byte data push.
-	dustLimit := lnwallet.DustLimitForSize(input.UnknownWitnessSize)
-
-	return channeldb.ChannelConstraints{
-		DustLimit:        dustLimit,
-		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-	}
 }
 
 // NewPartialChainControl creates a new partial chain control that contains all
@@ -255,6 +247,16 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			"cache: %v", err)
 	}
 
+	// Map the deprecated feeurl flag to fee.url.
+	if cfg.FeeURL != "" {
+		if cfg.Fee.URL != "" {
+			return nil, nil, errors.New("fee.url and " +
+				"feeurl are mutually exclusive")
+		}
+
+		cfg.Fee.URL = cfg.FeeURL
+	}
+
 	// If spv mode is active, then we'll be using a distinct set of
 	// chainControl interfaces that interface directly with the p2p network
 	// of the selected chain.
@@ -271,18 +273,6 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 		)
 		if err != nil {
 			return nil, nil, err
-		}
-
-		// Map the deprecated neutrino feeurl flag to the general fee
-		// url.
-		if cfg.NeutrinoMode.FeeURL != "" {
-			if cfg.FeeURL != "" {
-				return nil, nil, errors.New("feeurl and " +
-					"neutrino.feeurl are mutually " +
-					"exclusive")
-			}
-
-			cfg.FeeURL = cfg.NeutrinoMode.FeeURL
 		}
 
 		cc.ChainSource = chain.NewNeutrinoClient(
@@ -521,7 +511,21 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 
 		cc.HealthCheck = func() error {
 			_, err := chainConn.RawRequest(cmd, nil)
-			return err
+			if err != nil {
+				return err
+			}
+
+			// On local test networks we usually don't have multiple
+			// chain backend peers, so we can skip
+			// the checkOutboundPeers test.
+			if cfg.Bitcoin.SimNet || cfg.Bitcoin.RegTest {
+				return nil
+			}
+
+			// Make sure the bitcoind chain backend maintains a
+			// healthy connection to the network by checking the
+			// number of outbound peers.
+			return checkOutboundPeers(chainConn)
 		}
 
 	case "btcd":
@@ -545,7 +549,7 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			rpcCert, err = ioutil.ReadAll(certFile)
+			rpcCert, err = io.ReadAll(certFile)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -630,7 +634,21 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 		// Use a query for our best block as a health check.
 		cc.HealthCheck = func() error {
 			_, _, err := cc.ChainSource.GetBestBlock()
-			return err
+			if err != nil {
+				return err
+			}
+
+			// On local test networks we usually don't have multiple
+			// chain backend peers, so we can skip
+			// the checkOutboundPeers test.
+			if cfg.Bitcoin.SimNet || cfg.Bitcoin.RegTest {
+				return nil
+			}
+
+			// Make sure the btcd chain backend maintains a
+			// healthy connection to the network by checking the
+			// number of outbound peers.
+			return checkOutboundPeers(chainRPC.Client)
 		}
 
 		// If we're not in simnet or regtest mode, then we'll attempt
@@ -678,27 +696,34 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 	// If the fee URL isn't set, and the user is running mainnet, then
 	// we'll return an error to instruct them to set a proper fee
 	// estimator.
-	case cfg.FeeURL == "" && cfg.Bitcoin.MainNet &&
+	case cfg.Fee.URL == "" && cfg.Bitcoin.MainNet &&
 		cfg.Bitcoin.Node == "neutrino":
 
-		return nil, nil, fmt.Errorf("--feeurl parameter required " +
+		return nil, nil, fmt.Errorf("--fee.url parameter required " +
 			"when running neutrino on mainnet")
 
 	// Override default fee estimator if an external service is specified.
-	case cfg.FeeURL != "":
+	case cfg.Fee.URL != "":
 		// Do not cache fees on regtest to make it easier to execute
 		// manual or automated test cases.
 		cacheFees := !cfg.Bitcoin.RegTest
 
-		log.Infof("Using external fee estimator %v: cached=%v",
-			cfg.FeeURL, cacheFees)
+		log.Infof("Using external fee estimator %v: cached=%v: "+
+			"min update timeout=%v, max update timeout=%v",
+			cfg.Fee.URL, cacheFees, cfg.Fee.MinUpdateTimeout,
+			cfg.Fee.MaxUpdateTimeout)
 
-		cc.FeeEstimator = chainfee.NewWebAPIEstimator(
+		cc.FeeEstimator, err = chainfee.NewWebAPIEstimator(
 			chainfee.SparseConfFeeSource{
-				URL: cfg.FeeURL,
+				URL: cfg.Fee.URL,
 			},
 			!cacheFees,
+			cfg.Fee.MinUpdateTimeout,
+			cfg.Fee.MaxUpdateTimeout,
 		)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	ccCleanup := func() {
@@ -714,9 +739,6 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 	if err := cc.FeeEstimator.Start(); err != nil {
 		return nil, nil, err
 	}
-
-	// Select the default channel constraints for the primary chain.
-	cc.ChannelConstraints = GenDefaultBtcConstraints()
 
 	return cc, ccCleanup, nil
 }
@@ -750,11 +772,11 @@ func NewChainControl(walletConfig lnwallet.Config,
 
 	lnWallet, err := lnwallet.NewLightningWallet(walletConfig)
 	if err != nil {
-		return nil, ccCleanup, fmt.Errorf("unable to create wallet: %v",
+		return nil, ccCleanup, fmt.Errorf("unable to create wallet: %w",
 			err)
 	}
 	if err := lnWallet.Startup(); err != nil {
-		return nil, ccCleanup, fmt.Errorf("unable to create wallet: %v",
+		return nil, ccCleanup, fmt.Errorf("unable to create wallet: %w",
 			err)
 	}
 
@@ -860,3 +882,31 @@ var (
 		},
 	}
 )
+
+// checkOutboundPeers checks the number of outbound peers connected to the
+// provided RPC client. If the number of outbound peers is below 6, a warning
+// is logged. This function is intended to ensure that the chain backend
+// maintains a healthy connection to the network.
+func checkOutboundPeers(client *rpcclient.Client) error {
+	peers, err := client.GetPeerInfo()
+	if err != nil {
+		return err
+	}
+
+	var outboundPeers int
+	for _, peer := range peers {
+		if !peer.Inbound {
+			outboundPeers++
+		}
+	}
+
+	if outboundPeers < DefaultMinOutboundPeers {
+		log.Warnf("The chain backend has an insufficient number "+
+			"of connected outbound peers (%d connected, expected "+
+			"minimum is %d) which can be a security issue. "+
+			"Connect to more trusted nodes manually if necessary.",
+			outboundPeers, DefaultMinOutboundPeers)
+	}
+
+	return nil
+}

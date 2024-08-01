@@ -148,7 +148,7 @@ func TestConnectionCorrectness(t *testing.T) {
 	}
 }
 
-// TestConecurrentHandshakes verifies the listener's ability to not be blocked
+// TestConcurrentHandshakes verifies the listener's ability to not be blocked
 // by other pending handshakes. This is tested by opening multiple tcp
 // connections with the listener, without completing any of the brontide acts.
 // The test passes if real brontide dialer connects while the others are
@@ -274,7 +274,7 @@ func TestWriteMessageChunking(t *testing.T) {
 
 		bytesWritten, err := localConn.Write(largeMessage)
 		if err != nil {
-			errCh <- fmt.Errorf("unable to write message: %v", err)
+			errCh <- fmt.Errorf("unable to write message: %w", err)
 			return
 		}
 

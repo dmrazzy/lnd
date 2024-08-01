@@ -18,9 +18,11 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -74,14 +76,15 @@ var (
 	// failed to be processed.
 	ErrLocalAddFailed = errors.New("local add HTLC failed")
 
-	// errDustThresholdExceeded is only surfaced to callers of SendHTLC and
-	// signals that sending the HTLC would exceed the outgoing link's dust
-	// threshold.
-	errDustThresholdExceeded = errors.New("dust threshold exceeded")
+	// errFeeExposureExceeded is only surfaced to callers of SendHTLC and
+	// signals that sending the HTLC would exceed the outgoing link's fee
+	// exposure threshold.
+	errFeeExposureExceeded = errors.New("fee exposure exceeded")
 
-	// DefaultDustThreshold is the default threshold after which we'll fail
-	// payments if they are dust. This is currently set to 500m msats.
-	DefaultDustThreshold = lnwire.MilliSatoshi(500_000_000)
+	// DefaultMaxFeeExposure is the default threshold after which we'll
+	// fail payments if they increase our fee exposure. This is currently
+	// set to 500m msats.
+	DefaultMaxFeeExposure = lnwire.MilliSatoshi(500_000_000)
 )
 
 // plexPacket encapsulates switch packet and adds error channel to receive
@@ -209,9 +212,9 @@ type Config struct {
 	// a mailbox via AddPacket.
 	MailboxDeliveryTimeout time.Duration
 
-	// DustThreshold is the threshold in milli-satoshis after which we'll
-	// fail incoming or outgoing dust payments for a particular channel.
-	DustThreshold lnwire.MilliSatoshi
+	// MaxFeeExposure is the threshold in milli-satoshis after which we'll
+	// fail incoming or outgoing payments for a particular channel.
+	MaxFeeExposure lnwire.MilliSatoshi
 
 	// SignAliasUpdate is used when sending FailureMessages backwards for
 	// option_scid_alias channels. This avoids a potential privacy leak by
@@ -497,7 +500,7 @@ func (s *Switch) GetAttemptResult(attemptID uint64, paymentHash lntypes.Hash,
 			deobfuscator, n, attemptID, paymentHash,
 		)
 		if err != nil {
-			e := fmt.Errorf("unable to extract result: %v", err)
+			e := fmt.Errorf("unable to extract result: %w", err)
 			log.Error(e)
 			resultChan <- &PaymentResult{
 				Error: e,
@@ -558,9 +561,9 @@ func (s *Switch) SendHTLC(firstHop lnwire.ShortChannelID, attemptID uint64,
 		return linkErr
 	}
 
-	// Evaluate whether this HTLC would increase our exposure to dust. If
-	// it does, don't send it out and instead return an error.
-	if s.evaluateDustThreshold(link, htlc.Amount, false) {
+	// Evaluate whether this HTLC would bypass our fee exposure. If it
+	// does, don't send it out and instead return an error.
+	if s.dustExceedsFeeThreshold(link, htlc.Amount, false) {
 		// Notify the htlc notifier of a link failure on our outgoing
 		// link. We use the FailTemporaryChannelFailure in place of a
 		// more descriptive error message.
@@ -578,7 +581,7 @@ func (s *Switch) SendHTLC(firstHop lnwire.ShortChannelID, attemptID uint64,
 			false,
 		)
 
-		return errDustThresholdExceeded
+		return errFeeExposureExceeded
 	}
 
 	circuit := newPaymentCircuit(&htlc.PaymentHash, packet)
@@ -613,15 +616,14 @@ func (s *Switch) SendHTLC(firstHop lnwire.ShortChannelID, attemptID uint64,
 func (s *Switch) UpdateForwardingPolicies(
 	chanPolicies map[wire.OutPoint]models.ForwardingPolicy) {
 
-	log.Tracef("Updating link policies: %v", newLogClosure(func() string {
-		return spew.Sdump(chanPolicies)
-	}))
+	log.Tracef("Updating link policies: %v", lnutils.SpewLogClosure(
+		chanPolicies))
 
 	s.indexMtx.RLock()
 
 	// Update each link in chanPolicies.
 	for targetLink, policy := range chanPolicies {
-		cid := lnwire.NewChanIDFromOutPoint(&targetLink)
+		cid := lnwire.NewChanIDFromOutPoint(targetLink)
 
 		link, ok := s.linkIndex[cid]
 		if !ok {
@@ -709,7 +711,8 @@ func (s *Switch) ForwardPackets(linkQuit chan struct{},
 		default:
 			err := s.routeAsync(packet, fwdChan, linkQuit)
 			if err != nil {
-				return fmt.Errorf("failed to forward packet %v", err)
+				return fmt.Errorf("failed to forward packet %w",
+					err)
 			}
 			numSent++
 		}
@@ -754,7 +757,7 @@ func (s *Switch) ForwardPackets(linkQuit chan struct{},
 	for _, packet := range addedPackets {
 		err := s.routeAsync(packet, fwdChan, linkQuit)
 		if err != nil {
-			return fmt.Errorf("failed to forward packet %v", err)
+			return fmt.Errorf("failed to forward packet %w", err)
 		}
 		numSent++
 	}
@@ -1146,7 +1149,7 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 
 			return s.failAddPacket(packet, linkError)
 		}
-		targetPeerKey := targetLink.Peer().PubKey()
+		targetPeerKey := targetLink.PeerPubKey()
 		interfaceLinks, _ := s.getLinks(targetPeerKey)
 		s.indexMtx.RUnlock()
 
@@ -1177,7 +1180,9 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 				failure = link.CheckHtlcForward(
 					htlc.PaymentHash, packet.incomingAmount,
 					packet.amount, packet.incomingTimeout,
-					packet.outgoingTimeout, currentHeight,
+					packet.outgoingTimeout,
+					packet.inboundFee,
+					currentHeight,
 					packet.originalOutgoingChanID,
 				)
 			}
@@ -1210,9 +1215,8 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 				)
 				log.Warnf("unable to find err source for "+
 					"outgoing_link=%v, errors=%v",
-					packet.outgoingChanID, newLogClosure(func() string {
-						return spew.Sdump(linkErrs)
-					}))
+					packet.outgoingChanID,
+					lnutils.SpewLogClosure(linkErrs))
 			}
 
 			log.Tracef("incoming HTLC(%x) violated "+
@@ -1245,9 +1249,10 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 			return s.failAddPacket(packet, linkErr)
 		}
 
-		// Evaluate whether this HTLC would increase our exposure to
-		// dust on the incoming link. If it does, fail it backwards.
-		if s.evaluateDustThreshold(
+		// Evaluate whether this HTLC would increase our fee exposure
+		// over the threshold on the incoming link. If it does, fail it
+		// backwards.
+		if s.dustExceedsFeeThreshold(
 			incomingLink, packet.incomingAmount, true,
 		) {
 			// The incoming dust exceeds the threshold, so we fail
@@ -1259,9 +1264,10 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 			return s.failAddPacket(packet, linkErr)
 		}
 
-		// Also evaluate whether this HTLC would increase our exposure
-		// to dust on the destination link. If it does, fail it back.
-		if s.evaluateDustThreshold(
+		// Also evaluate whether this HTLC would increase our fee
+		// exposure over the threshold on the destination link. If it
+		// does, fail it back.
+		if s.dustExceedsFeeThreshold(
 			destination, packet.amount, false,
 		) {
 			// The outgoing dust exceeds the threshold, so we fail
@@ -1294,6 +1300,11 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 
 		fail, isFail := htlc.(*lnwire.UpdateFailHTLC)
 		if isFail && !packet.hasSource {
+			// HTLC resolutions and messages restored from disk
+			// don't have the obfuscator set from the original htlc
+			// add packet - set it here for use in blinded errors.
+			packet.obfuscator = circuit.ErrorEncrypter
+
 			switch {
 			// No message to encrypt, locally sourced payment.
 			case circuit.ErrorEncrypter == nil:
@@ -1468,7 +1479,7 @@ func (s *Switch) failAddPacket(packet *htlcPacket, failure *LinkError) error {
 
 	log.Error(failure.Error())
 
-	// Create a failure packet for this htlc. The the full set of
+	// Create a failure packet for this htlc. The full set of
 	// information about the htlc failure is included so that they can
 	// be included in link failure notifications.
 	failPkt := &htlcPacket{
@@ -1482,6 +1493,7 @@ func (s *Switch) failAddPacket(packet *htlcPacket, failure *LinkError) error {
 		incomingTimeout: packet.incomingTimeout,
 		outgoingTimeout: packet.outgoingTimeout,
 		circuit:         packet.circuit,
+		obfuscator:      packet.obfuscator,
 		linkFailure:     failure,
 		htlc: &lnwire.UpdateFailHTLC{
 			Reason: reason,
@@ -1796,7 +1808,7 @@ out:
 		// relevant link (if it exists) so the channel can be
 		// cooperatively closed (if possible).
 		case req := <-s.chanCloseRequests:
-			chanID := lnwire.NewChanIDFromOutPoint(req.ChanPoint)
+			chanID := lnwire.NewChanIDFromOutPoint(*req.ChanPoint)
 
 			s.indexMtx.RLock()
 			link, ok := s.linkIndex[chanID]
@@ -1809,9 +1821,9 @@ out:
 			}
 			s.indexMtx.RUnlock()
 
-			peerPub := link.Peer().PubKey()
+			peerPub := link.PeerPubKey()
 			log.Debugf("Requesting local channel close: peer=%v, "+
-				"chan_id=%x", link.Peer(), chanID[:])
+				"chan_id=%x", link.PeerPubKey(), chanID[:])
 
 			go s.cfg.LocalChannelClose(peerPub[:], req)
 
@@ -1838,6 +1850,10 @@ out:
 			// resolution message on restart.
 			resolutionMsg.errChan <- nil
 
+			// Create a htlc packet for this resolution. We do
+			// not have some of the information that we'll need
+			// for blinded error handling here , so we'll rely on
+			// our forwarding logic to fill it in later.
 			pkt := &htlcPacket{
 				outgoingChanID: resolutionMsg.SourceChan,
 				outgoingHTLCID: resolutionMsg.HtlcIndex,
@@ -1981,10 +1997,9 @@ out:
 				continue
 			}
 
-			log.Tracef("Acked %d settle fails: %v", len(s.pendingSettleFails),
-				newLogClosure(func() string {
-					return spew.Sdump(s.pendingSettleFails)
-				}))
+			log.Tracef("Acked %d settle fails: %v",
+				len(s.pendingSettleFails),
+				lnutils.SpewLogClosure(s.pendingSettleFails))
 
 			// Reset the pendingSettleFails buffer while keeping acquired
 			// memory.
@@ -2062,6 +2077,8 @@ func (s *Switch) reforwardResolutions() error {
 
 		// The circuit is still open, so we can assume that the link or
 		// switch (if we are the source) hasn't cleaned it up yet.
+		// We rely on our forwarding logic to fill in details that
+		// are not currently available to us.
 		resPkt := &htlcPacket{
 			outgoingChanID: resMsg.SourceChan,
 			outgoingHTLCID: resMsg.HtlcIndex,
@@ -2211,7 +2228,8 @@ func (s *Switch) reforwardSettleFails(fwdPkgs []*channeldb.FwdPkg) {
 				// we can continue to propagate it. This
 				// failure originated from another node, so
 				// the linkFailure field is not set on this
-				// packet.
+				// packet. We rely on the link to fill in
+				// additional circuit information for us.
 				failPacket := &htlcPacket{
 					outgoingChanID: fwdPkg.Source,
 					outgoingHTLCID: pd.ParentIndex,
@@ -2334,7 +2352,7 @@ func (s *Switch) addLiveLink(link ChannelLink) {
 
 	// Next we'll add the link to the interface index so we can
 	// quickly look up all the channels for a particular node.
-	peerPub := link.Peer().PubKey()
+	peerPub := link.PeerPubKey()
 	if _, ok := s.interfaceIndex[peerPub]; !ok {
 		s.interfaceIndex[peerPub] = make(map[lnwire.ChannelID]ChannelLink)
 	}
@@ -2609,7 +2627,7 @@ func (s *Switch) removeLink(chanID lnwire.ChannelID) ChannelLink {
 
 	// If the link has been added to the peer index, then we'll move to
 	// delete the entry within the index.
-	peerPub := link.Peer().PubKey()
+	peerPub := link.PeerPubKey()
 	if peerIndex, ok := s.interfaceIndex[peerPub]; ok {
 		delete(peerIndex, link.ChanID())
 
@@ -2754,14 +2772,15 @@ func (s *Switch) BestHeight() uint32 {
 	return atomic.LoadUint32(&s.bestHeight)
 }
 
-// evaluateDustThreshold takes in a ChannelLink, HTLC amount, and a boolean to
-// determine whether the default dust threshold has been exceeded. This
+// dustExceedsFeeThreshold takes in a ChannelLink, HTLC amount, and a boolean
+// to determine whether the default fee threshold has been exceeded. This
 // heuristic takes into account the trimmed-to-dust mechanism. The sum of the
 // commitment's dust with the mailbox's dust with the amount is checked against
-// the default threshold. If incoming is true, then the amount is not included
-// in the sum as it was already included in the commitment's dust. A boolean is
-// returned telling the caller whether the HTLC should be failed back.
-func (s *Switch) evaluateDustThreshold(link ChannelLink,
+// the fee exposure threshold. If incoming is true, then the amount is not
+// included in the sum as it was already included in the commitment's dust. A
+// boolean is returned telling the caller whether the HTLC should be failed
+// back.
+func (s *Switch) dustExceedsFeeThreshold(link ChannelLink,
 	amount lnwire.MilliSatoshi, incoming bool) bool {
 
 	// Retrieve the link's current commitment feerate and dustClosure.
@@ -2769,8 +2788,12 @@ func (s *Switch) evaluateDustThreshold(link ChannelLink,
 	isDust := link.getDustClosure()
 
 	// Evaluate if the HTLC is dust on either sides' commitment.
-	isLocalDust := isDust(feeRate, incoming, true, amount.ToSatoshis())
-	isRemoteDust := isDust(feeRate, incoming, false, amount.ToSatoshis())
+	isLocalDust := isDust(
+		feeRate, incoming, lntypes.Local, amount.ToSatoshis(),
+	)
+	isRemoteDust := isDust(
+		feeRate, incoming, lntypes.Remote, amount.ToSatoshis(),
+	)
 
 	if !(isLocalDust || isRemoteDust) {
 		// If the HTLC is not dust on either commitment, it's fine to
@@ -2787,7 +2810,9 @@ func (s *Switch) evaluateDustThreshold(link ChannelLink,
 	// If the htlc is dust on the local commitment, we'll obtain the dust
 	// sum for it.
 	if isLocalDust {
-		localSum := link.getDustSum(false)
+		localSum := link.getDustSum(
+			lntypes.Local, fn.None[chainfee.SatPerKWeight](),
+		)
 		localSum += localMailDust
 
 		// Optionally include the HTLC amount only for outgoing
@@ -2796,8 +2821,8 @@ func (s *Switch) evaluateDustThreshold(link ChannelLink,
 			localSum += amount
 		}
 
-		// Finally check against the defined dust threshold.
-		if localSum > s.cfg.DustThreshold {
+		// Finally check against the defined fee threshold.
+		if localSum > s.cfg.MaxFeeExposure {
 			return true
 		}
 	}
@@ -2805,7 +2830,9 @@ func (s *Switch) evaluateDustThreshold(link ChannelLink,
 	// Also check if the htlc is dust on the remote commitment, if we've
 	// reached this point.
 	if isRemoteDust {
-		remoteSum := link.getDustSum(true)
+		remoteSum := link.getDustSum(
+			lntypes.Remote, fn.None[chainfee.SatPerKWeight](),
+		)
 		remoteSum += remoteMailDust
 
 		// Optionally include the HTLC amount only for outgoing
@@ -2814,8 +2841,8 @@ func (s *Switch) evaluateDustThreshold(link ChannelLink,
 			remoteSum += amount
 		}
 
-		// Finally check against the defined dust threshold.
-		if remoteSum > s.cfg.DustThreshold {
+		// Finally check against the defined fee threshold.
+		if remoteSum > s.cfg.MaxFeeExposure {
 			return true
 		}
 	}

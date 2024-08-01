@@ -16,7 +16,8 @@ in `lnd` to help improve the overall readability.
 
 Blocks of code within `lnd` should be segmented into logical stanzas of
 operation. Such spacing makes the code easier to follow at a skim, and reduces
-unnecessary line noise. Coupled with the commenting scheme specified above,
+unnecessary line noise. Coupled with the commenting scheme specified in the
+[contribution guide](./code_contribution_guidelines.md#code-documentation-and-commenting),
 proper spacing allows readers to quickly scan code, extracting semantics quickly.
 Functions should _not_ just be laid out as a bare contiguous block of code.
 
@@ -124,8 +125,8 @@ myKey := "0214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e1" +
 ### Wrapping long function calls
 
 When wrapping a line that contains a function call as the unwrapped line exceeds
-the column limit, the close paren should be placed on its own line.
-Additionally, all arguments should begin in a new line after the open paren.
+the column limit, the close parenthesis should be placed on its own line.
+Additionally, all arguments should begin in a new line after the open parenthesis.
 
 **WRONG**
 ```go
@@ -179,8 +180,8 @@ like `require.NoErrorf()`.
 
 ### Wrapping long function definitions
 
-If one is forced to wrap lines of function arguments that exceed the 80
-character limit, then indentation must be kept on the following lines. Also,
+If one is forced to wrap lines of function arguments that exceed the 
+80-character limit, then indentation must be kept on the following lines. Also,
 lines should not end with an open parenthesis if the function definition isn't
 finished yet.
 
@@ -203,6 +204,9 @@ func foo(a, b,
 
 func baz(a, b, c) (d,
 	error) {
+
+func longFunctionName(
+	a, b, c) (d, error) {
 ```
 
 If a function declaration spans multiple lines the body should start with an
@@ -237,7 +241,7 @@ support the `EditorConfig` scheme (for example GoLand, GitHub, GitLab,
 VisualStudio). In addition, specific settings for Visual Studio Code are checked
 into the code base as well.
 
-Other editors (for example Atom, Nodepad++, Vim, Emacs and so on) might install
+Other editors (for example Atom, Notepad++, Vim, Emacs and so on) might install
 a plugin to understand the rules in the `.editorconfig` file.
 
-In Vim you might want to use `set colorcolumn=80`.
+In Vim, you might want to use `set colorcolumn=80`.

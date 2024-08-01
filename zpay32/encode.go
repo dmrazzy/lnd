@@ -39,11 +39,11 @@ func (invoice *Invoice) Encode(signer MessageSigner) (string, error) {
 	zeroes := make([]byte, timestampBase32Len-len(timestampBase32))
 	_, err := bufferBase32.Write(zeroes)
 	if err != nil {
-		return "", fmt.Errorf("unable to write to buffer: %v", err)
+		return "", fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(timestampBase32)
 	if err != nil {
-		return "", fmt.Errorf("unable to write to buffer: %v", err)
+		return "", fmt.Errorf("unable to write to buffer: %w", err)
 	}
 
 	// We now write the tagged fields to the buffer, which will fill the
@@ -260,6 +260,29 @@ func writeTaggedFields(bufferBase32 *bytes.Buffer, invoice *Invoice) error {
 		}
 	}
 
+	for _, path := range invoice.BlindedPaymentPaths {
+		var buf bytes.Buffer
+
+		err := path.Encode(&buf)
+		if err != nil {
+			return err
+		}
+
+		blindedPathBase32, err := bech32.ConvertBits(
+			buf.Bytes(), 8, 5, true,
+		)
+		if err != nil {
+			return err
+		}
+
+		err = writeTaggedField(
+			bufferBase32, fieldTypeB, blindedPathBase32,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	if invoice.Destination != nil {
 		// Convert 33 byte pubkey to 53 5-bit groups.
 		pubKeyBase32, err := bech32.ConvertBits(
@@ -332,15 +355,15 @@ func writeTaggedField(bufferBase32 *bytes.Buffer, dataType byte, data []byte) er
 
 	err := bufferBase32.WriteByte(dataType)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(lenBase32)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(data)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 
 	return nil

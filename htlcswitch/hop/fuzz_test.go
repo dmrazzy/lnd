@@ -88,11 +88,46 @@ func hopFromPayload(p *Payload) (*route.Hop, uint64) {
 		MPP:              p.MPP,
 		AMP:              p.AMP,
 		Metadata:         p.metadata,
+		EncryptedData:    p.encryptedData,
+		BlindingPoint:    p.blindingPoint,
 		CustomRecords:    p.customRecords,
+		TotalAmtMsat:     p.totalAmtMsat,
 	}, p.FwdInfo.NextHop.ToUint64()
 }
 
-func FuzzPayload(f *testing.F) {
+// FuzzPayloadFinal fuzzes final hop payloads, providing the additional context
+// that the hop should be final (which is usually obtained by the structure
+// of the sphinx packet) for the case where a blinding point was provided in
+// UpdateAddHtlc.
+func FuzzPayloadFinalBlinding(f *testing.F) {
+	fuzzPayload(f, true, true)
+}
+
+// FuzzPayloadFinal fuzzes final hop payloads, providing the additional context
+// that the hop should be final (which is usually obtained by the structure
+// of the sphinx packet) for the case where no blinding point was provided in
+// UpdateAddHtlc.
+func FuzzPayloadFinalNoBlinding(f *testing.F) {
+	fuzzPayload(f, true, false)
+}
+
+// FuzzPayloadIntermediate fuzzes intermediate hop payloads, providing the
+// additional context that a hop should be intermediate (which is usually
+// obtained by the structure of the sphinx packet) for the case where a
+// blinding point was provided in UpdateAddHtlc.
+func FuzzPayloadIntermediateBlinding(f *testing.F) {
+	fuzzPayload(f, false, true)
+}
+
+// FuzzPayloadIntermediate fuzzes intermediate hop payloads, providing the
+// additional context that a hop should be intermediate (which is usually
+// obtained by the structure of the sphinx packet) for the case where no
+// blinding point was provided in UpdateAddHtlc.
+func FuzzPayloadIntermediateNoBlinding(f *testing.F) {
+	fuzzPayload(f, false, false)
+}
+
+func fuzzPayload(f *testing.F, finalPayload, updateAddBlinded bool) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > sphinx.MaxPayloadSize {
 			return
@@ -100,25 +135,47 @@ func FuzzPayload(f *testing.F) {
 
 		r := bytes.NewReader(data)
 
-		payload1, err := NewPayloadFromReader(r)
+		payload1, parsed, err := ParseTLVPayload(r)
 		if err != nil {
+			return
+		}
+
+		if err = ValidateParsedPayloadTypes(
+			parsed, finalPayload, updateAddBlinded,
+		); err != nil {
 			return
 		}
 
 		var b bytes.Buffer
 		hop, nextChanID := hopFromPayload(payload1)
-		err = hop.PackHopPayload(&b, nextChanID)
-		if errors.Is(err, route.ErrAMPMissingMPP) {
-			// PackHopPayload refuses to encode an AMP record
-			// without an MPP record. However, NewPayloadFromReader
-			// does allow decoding an AMP record without an MPP
-			// record, since validation is done at a later stage. Do
-			// not report a bug for this case.
+		err = hop.PackHopPayload(&b, nextChanID, finalPayload)
+		switch {
+		// PackHopPayload refuses to encode an AMP record
+		// without an MPP record. However, ValidateParsedPayloadTypes
+		// does allow decoding an AMP record without an MPP
+		// record, since validation is done at a later stage. Do
+		// not report a bug for this case.
+		case errors.Is(err, route.ErrAMPMissingMPP):
 			return
+
+		// PackHopPayload will not encode regular payloads or final
+		// hops in blinded routes that do not have an amount or expiry
+		// TLV set. However, ValidateParsedPayloadTypes will allow
+		// creation of payloads where these TLVs are present, but they
+		// have zero values because validation is done at a later stage.
+		case errors.Is(err, route.ErrMissingField):
+			return
+
+		default:
+			require.NoError(t, err)
 		}
+
+		payload2, parsed, err := ParseTLVPayload(&b)
 		require.NoError(t, err)
 
-		payload2, err := NewPayloadFromReader(&b)
+		err = ValidateParsedPayloadTypes(
+			parsed, finalPayload, updateAddBlinded,
+		)
 		require.NoError(t, err)
 
 		require.Equal(t, payload1, payload2)

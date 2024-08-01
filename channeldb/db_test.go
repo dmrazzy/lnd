@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/stretchr/testify/require"
@@ -140,7 +141,7 @@ func TestFetchClosedChannelForID(t *testing.T) {
 		state.FundingOutpoint.Index = i
 
 		// We calculate the ChannelID and use it to fetch the summary.
-		cid := lnwire.NewChanIDFromOutPoint(&state.FundingOutpoint)
+		cid := lnwire.NewChanIDFromOutPoint(state.FundingOutpoint)
 		fetchedSummary, err := cdb.FetchClosedChannelForID(cid)
 		if err != nil {
 			t.Fatalf("unable to fetch close summary: %v", err)
@@ -158,7 +159,7 @@ func TestFetchClosedChannelForID(t *testing.T) {
 	// As a final test we make sure that we get ErrClosedChannelNotFound
 	// for a ChannelID we didn't add to the DB.
 	state.FundingOutpoint.Index++
-	cid := lnwire.NewChanIDFromOutPoint(&state.FundingOutpoint)
+	cid := lnwire.NewChanIDFromOutPoint(state.FundingOutpoint)
 	_, err = cdb.FetchClosedChannelForID(cid)
 	if err != ErrClosedChannelNotFound {
 		t.Fatalf("expected ErrClosedChannelNotFound, instead got: %v", err)
@@ -240,7 +241,7 @@ func TestFetchChannel(t *testing.T) {
 	require.Equal(t, channelState, dbChannel)
 
 	// Next, attempt to fetch the channel by its channel ID.
-	chanID := lnwire.NewChanIDFromOutPoint(&channelState.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(channelState.FundingOutpoint)
 	dbChannel, err = cdb.FetchChannelByID(nil, chanID)
 	require.NoError(t, err, "unable to fetch channel")
 
@@ -259,7 +260,7 @@ func TestFetchChannel(t *testing.T) {
 	_, err = cdb.FetchChannel(nil, channelState2.FundingOutpoint)
 	require.ErrorIs(t, err, ErrChannelNotFound)
 
-	chanID2 := lnwire.NewChanIDFromOutPoint(&channelState2.FundingOutpoint)
+	chanID2 := lnwire.NewChanIDFromOutPoint(channelState2.FundingOutpoint)
 	_, err = cdb.FetchChannelByID(nil, chanID2)
 	require.ErrorIs(t, err, ErrChannelNotFound)
 }
@@ -606,7 +607,9 @@ func TestFetchChannels(t *testing.T) {
 				channelIDOption(pendingWaitingChan),
 			)
 
-			err = pendingClosing.MarkCoopBroadcasted(nil, true)
+			err = pendingClosing.MarkCoopBroadcasted(
+				nil, lntypes.Local,
+			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -626,7 +629,9 @@ func TestFetchChannels(t *testing.T) {
 				channelIDOption(openWaitingChan),
 				openChannelOption(),
 			)
-			err = openClosing.MarkCoopBroadcasted(nil, true)
+			err = openClosing.MarkCoopBroadcasted(
+				nil, lntypes.Local,
+			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

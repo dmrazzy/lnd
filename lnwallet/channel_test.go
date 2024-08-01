@@ -21,10 +21,12 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -831,7 +833,7 @@ func TestForceClose(t *testing.T) {
 
 type forceCloseTestCase struct {
 	chanType             channeldb.ChannelType
-	expectedCommitWeight int64
+	expectedCommitWeight lntypes.WeightUnit
 	anchorAmt            btcutil.Amount
 }
 
@@ -1656,7 +1658,10 @@ func TestChannelBalanceDustLimit(t *testing.T) {
 	htlcAmount := lnwire.NewMSatFromSatoshis(htlcSat)
 
 	htlc, preimage := createHTLC(0, htlcAmount)
-	aliceHtlcIndex, err := aliceChannel.AddHTLC(htlc, nil)
+
+	// We need to use `addHTLC` instead of `AddHTLC` so that we do not
+	// enforce the FeeBuffer on alice side.
+	aliceHtlcIndex, err := aliceChannel.addHTLC(htlc, nil, NoBuffer)
 	require.NoError(t, err, "alice unable to add htlc")
 	bobHtlcIndex, err := bobChannel.ReceiveHTLC(htlc)
 	require.NoError(t, err, "bob unable to receive htlc")
@@ -2144,8 +2149,8 @@ func TestCooperativeCloseDustAdherence(t *testing.T) {
 	}
 
 	resetChannelState := func() {
-		aliceChannel.status = channelOpen
-		bobChannel.status = channelOpen
+		aliceChannel.ResetState()
+		bobChannel.ResetState()
 	}
 
 	setBalances := func(aliceBalance, bobBalance lnwire.MilliSatoshi) {
@@ -2872,10 +2877,10 @@ func assertNoChanSyncNeeded(t *testing.T, aliceChannel *LightningChannel,
 	// nonces.
 	if aliceChannel.channelState.ChanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceChanSyncMsg.LocalNonce,
+			PubNonce: aliceChanSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobChanSyncMsg.LocalNonce,
+			PubNonce: bobChanSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 	}
 
@@ -3034,7 +3039,6 @@ func TestChanSyncOweCommitment(t *testing.T) {
 			Amount:      htlcAmt,
 			Expiry:      uint32(10),
 			OnionBlob:   fakeOnionBlob,
-			ExtraData:   make([]byte, 0),
 		}
 
 		htlcIndex, err := bobChannel.AddHTLC(h, nil)
@@ -3049,7 +3053,7 @@ func TestChanSyncOweCommitment(t *testing.T) {
 	}
 
 	chanID := lnwire.NewChanIDFromOutPoint(
-		&aliceChannel.channelState.FundingOutpoint,
+		aliceChannel.channelState.FundingOutpoint,
 	)
 
 	// With the HTLC's applied to both update logs, we'll initiate a state
@@ -3079,7 +3083,6 @@ func TestChanSyncOweCommitment(t *testing.T) {
 		Amount:      htlcAmt,
 		Expiry:      uint32(10),
 		OnionBlob:   fakeOnionBlob,
-		ExtraData:   make([]byte, 0),
 	}
 	aliceHtlcIndex, err := aliceChannel.AddHTLC(aliceHtlc, nil)
 	require.NoError(t, err, "unable to add alice's htlc")
@@ -3416,7 +3419,7 @@ func testChanSyncOweRevocation(t *testing.T, chanType channeldb.ChannelType) {
 	require.NoError(t, err, "unable to create test channels")
 
 	chanID := lnwire.NewChanIDFromOutPoint(
-		&aliceChannel.channelState.FundingOutpoint,
+		aliceChannel.channelState.FundingOutpoint,
 	)
 
 	// We'll start the test with Bob extending a single HTLC to Alice, and
@@ -3483,10 +3486,10 @@ func testChanSyncOweRevocation(t *testing.T, chanType channeldb.ChannelType) {
 	// nonces.
 	if chanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceSyncMsg.LocalNonce,
+			PubNonce: aliceSyncMsg.LocalNonce.UnwrapOrFail(t).Val,
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobSyncMsg.LocalNonce,
+			PubNonce: bobSyncMsg.LocalNonce.UnwrapOrFail(t).Val,
 		}
 	}
 
@@ -3545,10 +3548,10 @@ func testChanSyncOweRevocation(t *testing.T, chanType channeldb.ChannelType) {
 	// nonces.
 	if chanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceSyncMsg.LocalNonce,
+			PubNonce: aliceSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobSyncMsg.LocalNonce,
+			PubNonce: bobSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 	}
 
@@ -3668,10 +3671,10 @@ func testChanSyncOweRevocationAndCommit(t *testing.T,
 	// nonces.
 	if chanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceSyncMsg.LocalNonce,
+			PubNonce: aliceSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobSyncMsg.LocalNonce,
+			PubNonce: bobSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 	}
 
@@ -3748,10 +3751,10 @@ func testChanSyncOweRevocationAndCommit(t *testing.T,
 	// nonces.
 	if chanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceSyncMsg.LocalNonce,
+			PubNonce: aliceSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobSyncMsg.LocalNonce,
+			PubNonce: bobSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 	}
 
@@ -3885,10 +3888,10 @@ func testChanSyncOweRevocationAndCommitForceTransition(t *testing.T,
 	// nonces.
 	if chanType.IsTaproot() {
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *aliceSyncMsg.LocalNonce,
+			PubNonce: aliceSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: *bobSyncMsg.LocalNonce,
+			PubNonce: bobSyncMsg.LocalNonce.UnwrapOrFailV(t),
 		}
 	}
 
@@ -4679,7 +4682,7 @@ func TestChanSyncUnableToSync(t *testing.T) {
 	// state.
 	badChanSync := &lnwire.ChannelReestablish{
 		ChanID: lnwire.NewChanIDFromOutPoint(
-			&aliceChannel.channelState.FundingOutpoint,
+			aliceChannel.channelState.FundingOutpoint,
 		),
 		NextLocalCommitHeight:  1000,
 		RemoteCommitTailHeight: 9000,
@@ -4783,6 +4786,8 @@ func TestChanSyncInvalidLastSecret(t *testing.T) {
 func TestChanAvailableBandwidth(t *testing.T) {
 	t.Parallel()
 
+	cType := channeldb.SingleFunderTweaklessBit
+
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
@@ -4797,11 +4802,10 @@ func TestChanAvailableBandwidth(t *testing.T) {
 	feeRate := chainfee.SatPerKWeight(
 		aliceChannel.channelState.LocalCommitment.FeePerKw,
 	)
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feeRate.FeeForWeight(input.HTLCWeight),
-	)
 
-	assertBandwidthEstimateCorrect := func(aliceInitiate bool) {
+	assertBandwidthEstimateCorrect := func(aliceInitiate bool,
+		numNonDustHtlcsOnCommit lntypes.WeightUnit) {
+
 		// With the HTLC's added, we'll now query the AvailableBalance
 		// method for the current available channel bandwidth from
 		// Alice's PoV.
@@ -4826,12 +4830,23 @@ func TestChanAvailableBandwidth(t *testing.T) {
 
 		// Now, we'll obtain the current available bandwidth in Alice's
 		// latest commitment and compare that to the prior estimate.
-		aliceBalance := aliceChannel.channelState.LocalCommitment.LocalBalance
+		aliceState := aliceChannel.State().Snapshot()
+		aliceBalance := aliceState.LocalBalance
+		commitFee := lnwire.NewMSatFromSatoshis(aliceState.CommitFee)
+		commitWeight := CommitWeight(cType)
+		commitWeight += numNonDustHtlcsOnCommit * input.HTLCWeight
+
+		// Add weight for an additional htlc because this is also done
+		// when evaluating the current balance.
+		feeBuffer := CalcFeeBuffer(
+			feeRate, commitWeight+input.HTLCWeight,
+		)
 
 		// The balance we have available for new HTLCs should be the
 		// current local commitment balance, minus the channel reserve
-		// and the fee for adding an HTLC.
-		expBalance := aliceBalance - aliceReserve - htlcFee
+		// and the fee buffer we have to account for.
+		expBalance := aliceBalance + commitFee - aliceReserve -
+			feeBuffer
 		if expBalance != aliceAvailableBalance {
 			_, _, line, _ := runtime.Caller(1)
 			t.Fatalf("line: %v, incorrect balance: expected %v, "+
@@ -4841,10 +4856,10 @@ func TestChanAvailableBandwidth(t *testing.T) {
 
 	// First, we'll add 3 outgoing HTLC's from Alice to Bob.
 	const numHtlcs = 3
-	var htlcAmt lnwire.MilliSatoshi = 100000
+	var dustAmt lnwire.MilliSatoshi = 100000
 	alicePreimages := make([][32]byte, numHtlcs)
 	for i := 0; i < numHtlcs; i++ {
-		htlc, preImage := createHTLC(i, htlcAmt)
+		htlc, preImage := createHTLC(i, dustAmt)
 		if _, err := aliceChannel.AddHTLC(htlc, nil); err != nil {
 			t.Fatalf("unable to add htlc: %v", err)
 		}
@@ -4855,12 +4870,12 @@ func TestChanAvailableBandwidth(t *testing.T) {
 		alicePreimages[i] = preImage
 	}
 
-	assertBandwidthEstimateCorrect(true)
+	assertBandwidthEstimateCorrect(true, 0)
 
 	// We'll repeat the same exercise, but with non-dust HTLCs. So we'll
 	// crank up the value of the HTLC's we're adding to the commitment
 	// transaction.
-	htlcAmt = lnwire.NewMSatFromSatoshis(30000)
+	htlcAmt := lnwire.NewMSatFromSatoshis(30000)
 	for i := 0; i < numHtlcs; i++ {
 		htlc, preImage := createHTLC(numHtlcs+i, htlcAmt)
 		if _, err := aliceChannel.AddHTLC(htlc, nil); err != nil {
@@ -4873,10 +4888,10 @@ func TestChanAvailableBandwidth(t *testing.T) {
 		alicePreimages = append(alicePreimages, preImage)
 	}
 
-	assertBandwidthEstimateCorrect(true)
+	assertBandwidthEstimateCorrect(true, 3)
 
-	// Next, we'll have Bob 5 of Alice's HTLC's, and cancel one of them (in
-	// the update log).
+	// Next, we'll have Bob settle 5 of Alice's HTLC's, and cancel one of
+	// them (in the update log).
 	for i := 0; i < (numHtlcs*2)-1; i++ {
 		preImage := alicePreimages[i]
 		err := bobChannel.SettleHTLC(preImage, uint64(i), nil, nil, nil)
@@ -4904,21 +4919,22 @@ func TestChanAvailableBandwidth(t *testing.T) {
 
 	// With the HTLC's settled in the log, we'll now assert that if we
 	// initiate a state transition, then our guess was correct.
-	assertBandwidthEstimateCorrect(false)
+	assertBandwidthEstimateCorrect(true, 0)
 
 	// TODO(roasbeef): additional tests from diff starting conditions
 }
 
 // TestChanAvailableBalanceNearHtlcFee checks that we get the expected reported
-// balance when it is close to the htlc fee.
+// balance when it is close to the fee buffer.
 func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 	t.Parallel()
 
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
+	cType := channeldb.SingleFunderTweaklessBit
 	aliceChannel, bobChannel, err := CreateTestChannels(
-		t, channeldb.SingleFunderTweaklessBit,
+		t, cType,
 	)
 	require.NoError(t, err, "unable to create test channels")
 
@@ -4939,6 +4955,13 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 	feeRate := chainfee.SatPerKWeight(
 		aliceChannel.channelState.LocalCommitment.FeePerKw,
 	)
+
+	// When calculating the fee buffer sending an htlc we need to account
+	// for an additional output on the commitment tx which this send will
+	// generate.
+	commitWeight := CommitWeight(cType)
+	feeBuffer := CalcFeeBuffer(feeRate, commitWeight+input.HTLCWeight)
+
 	htlcFee := lnwire.NewMSatFromSatoshis(
 		feeRate.FeeForWeight(input.HTLCWeight),
 	)
@@ -4977,7 +5000,12 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 		t.Helper()
 
 		htlc, preImage := createHTLC(int(htlcIndex), htlcAmt)
-		if _, err := aliceChannel.AddHTLC(htlc, nil); err != nil {
+
+		// For this testcase we don't want to enforce the FeeBuffer
+		// so that we can verify the edge cases when our balance reaches
+		// the channel reserve limit.
+		_, err := aliceChannel.addHTLC(htlc, nil, NoBuffer)
+		if err != nil {
 			t.Fatalf("unable to add htlc: %v", err)
 		}
 		if _, err := bobChannel.ReceiveHTLC(htlc); err != nil {
@@ -5009,11 +5037,9 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 	}
 
 	// Balance should start out equal to half the channel capacity minus
-	// the commitment fee Alice must pay and the channel reserve. In
-	// addition the HTLC fee will be subtracted fromt the balance to
-	// reflect that this value must be reserved for any payment above the
-	// dust limit.
-	expAliceBalance := aliceBalance - commitFee - aliceReserve - htlcFee
+	// the reserve and the fee buffer because alice is the initiator of
+	// the channel.
+	expAliceBalance := aliceBalance - aliceReserve - feeBuffer
 
 	// Bob is not the initiator, so he will have all his balance available,
 	// since Alice pays for fees. Bob only need to keep his balance above
@@ -5026,7 +5052,7 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 
 	// Send a HTLC leaving Alice's remaining balance just enough to have
 	// nonDustHtlc left after paying the commit fee and htlc fee.
-	htlcAmt := aliceBalance - (commitFee + aliceReserve + htlcFee + aliceNonDustHtlc)
+	htlcAmt := aliceBalance - (aliceReserve + feeBuffer + aliceNonDustHtlc)
 	sendHtlc(htlcAmt)
 
 	// Now the real balance left will be
@@ -5037,7 +5063,7 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 	expBobBalance = bobBalance - bobReserve
 	checkBalance(t, expAliceBalance, expBobBalance)
 
-	// Send an HTLC using all but one msat of the reported balance.
+	// Send an dust HTLC using all but one msat of the reported balance.
 	htlcAmt = aliceNonDustHtlc - 1
 	sendHtlc(htlcAmt)
 
@@ -5063,12 +5089,15 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 	expBobBalance = bobBalance - bobReserve
 	checkBalance(t, expAliceBalance, expBobBalance)
 
-	// Even though Alice has a reported balance of 0, this is because we
-	// try to avoid getting into the position where she cannot pay the fee
-	// for Bob adding another HTLC. This means she actually _has_ some
-	// balance left, and we now force the channel into this situation by
-	// sending yet another HTLC. In practice this can also happen if a fee
-	// update eats into Alice's balance.
+	// The available balance is zero for alice but there is still the
+	// fee buffer left (which includes the current commitment weight).
+	// We send the buffer to bob but also keep the funds for the htlc
+	// available otherwise we would not able to send this amount.
+	htlcAmt = feeBuffer - commitFee - htlcFee
+	sendHtlc(htlcAmt)
+
+	// Now we send a dust htlc of 1 msat to bob so that we cannot afford
+	// to put another non-dust htlc on this commitment.
 	htlcAmt = 1
 	sendHtlc(htlcAmt)
 
@@ -5159,13 +5188,15 @@ func TestChanCommitWeightDustHtlcs(t *testing.T) {
 
 	// Helper method that fetches the current remote commitment weight
 	// fromt the given channel's POV.
-	remoteCommitWeight := func(lc *LightningChannel) int64 {
+	// When sending htlcs we enforce the feebuffer on the commitment
+	// transaction.
+	remoteCommitWeight := func(lc *LightningChannel) lntypes.WeightUnit {
 		remoteACKedIndex := lc.localCommitChain.tip().theirMessageIndex
 		htlcView := lc.fetchHTLCView(remoteACKedIndex,
 			lc.localUpdateLog.logIndex)
 
 		_, w := lc.availableCommitmentBalance(
-			htlcView, true,
+			htlcView, lntypes.Remote, FeeBuffer,
 		)
 
 		return w
@@ -6765,10 +6796,10 @@ func compareLogs(a, b *updateLog) error {
 	}
 
 	if err := compareIndexes(a.updateIndex, b.updateIndex); err != nil {
-		return fmt.Errorf("update indexes don't match: %v", err)
+		return fmt.Errorf("update indexes don't match: %w", err)
 	}
 	if err := compareIndexes(a.htlcIndex, b.htlcIndex); err != nil {
-		return fmt.Errorf("htlc indexes don't match: %v", err)
+		return fmt.Errorf("htlc indexes don't match: %w", err)
 	}
 
 	if a.Len() != b.Len() {
@@ -7484,67 +7515,146 @@ func TestForceCloseBorkedState(t *testing.T) {
 }
 
 // TestChannelMaxFeeRate ensures we correctly compute a channel initiator's max
-// fee rate based on an allocation and its available balance. It should never
-// dip below the established fee floor.
+// fee rate based on an allocation and its available balance. When a very low
+// fee allocation value is selected the max fee rate is always floored at the
+// current fee rate of the channel.
 func TestChannelMaxFeeRate(t *testing.T) {
 	t.Parallel()
-
-	assertMaxFeeRate := func(c *LightningChannel, maxAlloc float64,
-		expFeeRate chainfee.SatPerKWeight) {
-
-		maxFeeRate := c.MaxFeeRate(maxAlloc)
-		if maxFeeRate != expFeeRate {
-			t.Fatalf("expected max fee rate of %v with max "+
-				"allocation of %v, got %v", expFeeRate,
-				maxAlloc, maxFeeRate)
-		}
-
-		if err := c.validateFeeRate(maxFeeRate); err != nil {
-			t.Fatalf("fee rate validation failed: %v", err)
-		}
-	}
 
 	// propertyTest tests that the validateFeeRate function always passes
 	// for the output returned by MaxFeeRate for any valid random inputs
 	// fed to MaxFeeRate.
 	propertyTest := func(c *LightningChannel) func(alloc maxAlloc) bool {
 		return func(ma maxAlloc) bool {
-			maxFeeRate := c.MaxFeeRate(float64(ma))
+			maxFeeRate, _ := c.MaxFeeRate(float64(ma))
 			return c.validateFeeRate(maxFeeRate) == nil
 		}
 	}
 
-	aliceChannel, _, err := CreateTestChannels(
+	// Create a non-anchor and an anchor channel setup.
+	nonAnchorChannel, _, err := CreateTestChannels(
 		t, channeldb.SingleFunderTweaklessBit,
 	)
 	require.NoError(t, err, "unable to create test channels")
 
-	if err := quick.Check(propertyTest(aliceChannel), nil); err != nil {
-		t.Fatal(err)
-	}
-
-	assertMaxFeeRate(aliceChannel, 1.0, 676794154)
-	assertMaxFeeRate(aliceChannel, 0.001, 676794)
-	assertMaxFeeRate(aliceChannel, 0.000001, 676)
-	assertMaxFeeRate(aliceChannel, 0.0000001, chainfee.FeePerKwFloor)
-
-	// Check that anchor channels are capped at their max fee rate.
 	anchorChannel, _, err := CreateTestChannels(
 		t, channeldb.SingleFunderTweaklessBit|
 			channeldb.AnchorOutputsBit|channeldb.ZeroHtlcTxFeeBit,
 	)
 	require.NoError(t, err, "unable to create test channels")
 
-	if err = quick.Check(propertyTest(anchorChannel), nil); err != nil {
-		t.Fatal(err)
+	// Run the property tests for both channel types.
+	err = quick.Check(propertyTest(nonAnchorChannel), nil)
+	require.NoError(t, err)
+
+	err = quick.Check(propertyTest(anchorChannel), nil)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name               string
+		channel            *LightningChannel
+		maxFeeAlloc        float64
+		expectedFeeAlloc   float64
+		expectedMinFeeRate bool
+	}{
+		{
+			name:             "non-anchor-channel high fee alloc",
+			channel:          nonAnchorChannel,
+			maxFeeAlloc:      1.0,
+			expectedFeeAlloc: 1.0,
+		},
+		{
+			name: "non-anchor-channel chan low fee " +
+				"alloc",
+			channel:          nonAnchorChannel,
+			maxFeeAlloc:      1e-3,
+			expectedFeeAlloc: 1e-3,
+		},
+		{
+			name:             "anchor-channel high chan fee alloc",
+			channel:          anchorChannel,
+			maxFeeAlloc:      1.0,
+			expectedFeeAlloc: 1.0,
+		},
+		{
+			name:             "anchor-channel low fee alloc",
+			channel:          anchorChannel,
+			maxFeeAlloc:      1e-3,
+			expectedFeeAlloc: 1e-3,
+		},
+		{
+			// The fee rate is capped at the current fee rate if the
+			// fee allocation is too low.
+			name: "non-anchor-channel current fee rate " +
+				"cap",
+			channel:            nonAnchorChannel,
+			maxFeeAlloc:        1e-6,
+			expectedMinFeeRate: true,
+		},
+		{
+			name: "non-anchor-channel current fee rate " +
+				"cap",
+			channel:            nonAnchorChannel,
+			maxFeeAlloc:        1e-8,
+			expectedMinFeeRate: true,
+		},
+		{
+			name: "anchor-channel current fee rate " +
+				"cap",
+			channel:            anchorChannel,
+			maxFeeAlloc:        1e-6,
+			expectedMinFeeRate: true,
+		},
+		{
+			name: "anchor-channel current fee rate " +
+				"cap",
+			channel:            anchorChannel,
+			maxFeeAlloc:        1e-8,
+			expectedMinFeeRate: true,
+		},
 	}
 
-	// Anchor commitments are heavier, hence will the same allocation lead
-	// to slightly lower fee rates.
-	assertMaxFeeRate(anchorChannel, 1.0, 435941555)
-	assertMaxFeeRate(anchorChannel, 0.001, 435941)
-	assertMaxFeeRate(anchorChannel, 0.000001, 435)
-	assertMaxFeeRate(anchorChannel, 0.0000001, chainfee.FeePerKwFloor)
+	for _, testCase := range testCases {
+		tc := testCase
+
+		maxFeeRate, feeAllocation := tc.channel.MaxFeeRate(
+			tc.maxFeeAlloc,
+		)
+
+		currentFeeRate := chainfee.SatPerKWeight(
+			tc.channel.channelState.LocalCommitment.FeePerKw,
+		)
+
+		// When the fee allocation would push our max fee rate below our
+		// current commitment fee rate of the channel we cap the max fee
+		// rate at the current fee rate of the channel. There might be
+		// some rounding inaccuracies due to the fee rate calculation
+		// therefore we accept a relative error of 0.1%.
+		if tc.expectedMinFeeRate {
+			require.InEpsilonf(
+				t, float64(currentFeeRate), float64(maxFeeRate),
+				1e-3, "expected max fee rate:%d, got max "+
+					"fee rate :%d", currentFeeRate,
+				maxFeeRate,
+			)
+		} else {
+			// When the max fee rate is not capped because there
+			// is enough balance to allocate funds from we compare
+			// the fee allocation rather then the max fee rate so
+			// that we can reason more easily about the test values.
+			// Because of floating point operations we accept
+			// a relative error of 0.1%.
+			require.InEpsilonf(
+				t, tc.expectedFeeAlloc, feeAllocation, 1e-3,
+				"expected fee allocation:%f, got fee "+
+					"allocation:%f", tc.expectedFeeAlloc,
+				feeAllocation,
+			)
+		}
+
+		err := tc.channel.validateFeeRate(maxFeeRate)
+		require.NoErrorf(t, err, "fee rate validation failed")
+	}
 }
 
 // TestIdealCommitFeeRate tests that we correctly compute the ideal commitment
@@ -7552,23 +7662,6 @@ func TestChannelMaxFeeRate(t *testing.T) {
 // fee allocation and whether the channel has anchor outputs.
 func TestIdealCommitFeeRate(t *testing.T) {
 	t.Parallel()
-
-	assertIdealFeeRate := func(c *LightningChannel, netFee, minRelay,
-		maxAnchorCommit chainfee.SatPerKWeight,
-		maxFeeAlloc float64, expectedFeeRate chainfee.SatPerKWeight) {
-
-		feeRate := c.IdealCommitFeeRate(
-			netFee, minRelay, maxAnchorCommit, maxFeeAlloc,
-		)
-		if feeRate != expectedFeeRate {
-			t.Fatalf("expected fee rate of %v got %v",
-				expectedFeeRate, feeRate)
-		}
-
-		if err := c.validateFeeRate(feeRate); err != nil {
-			t.Fatalf("fee rate validation failed: %v", err)
-		}
-	}
 
 	// propertyTest tests that the validateFeeRate function always passes
 	// for the output returned by IdealCommitFeeRate for any valid random
@@ -7590,115 +7683,251 @@ func TestIdealCommitFeeRate(t *testing.T) {
 		}
 	}
 
-	// Test ideal fee rates for a non-anchor channel
+	// Create a non-anchor channel and an anchor test channel.
+	nonAnchorChannel, _, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	if err != nil {
+		t.Fatalf("unable to create test channels: %v", err)
+	}
+
+	anchorChannel, _, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit|
+			channeldb.AnchorOutputsBit|
+			channeldb.ZeroHtlcTxFeeBit,
+	)
+	if err != nil {
+		t.Fatalf("unable to create test channels: %v", err)
+	}
+
+	// Run the property tests for both channel types (non-anchor and
+	// anchor).
+	err = quick.Check(propertyTest(nonAnchorChannel), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = quick.Check(propertyTest(anchorChannel), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// maxFeeRate is a helper function which calculates the maximum fee rate
+	// a channel is allowed to allocate to fees. It does not take a minimum
+	// fee rate into account.
+	maxFeeRate := func(c *LightningChannel,
+		maxFeeAlloc float64) chainfee.SatPerKWeight {
+
+		balance, weight := c.availableBalance(AdditionalHtlc)
+		feeRate := c.localCommitChain.tip().feePerKw
+		currentFee := feeRate.FeeForWeight(weight)
+
+		maxBalance := balance.ToSatoshis() + currentFee
+
+		maxFee := float64(maxBalance) * maxFeeAlloc
+
+		maxFeeRate := chainfee.SatPerKWeight(
+			maxFee / (float64(weight) / 1000),
+		)
+
+		return maxFeeRate
+	}
+
+	// currentFeeRate calculates the current fee rate of the channel. The
+	// ideal fee rate is floored at the current fee rate of the channel.
+	currentFeeRate := func(c *LightningChannel) chainfee.SatPerKWeight {
+		return c.localCommitChain.tip().feePerKw
+	}
+
+	// testCase definies the test cases when calculating the ideal fee rate
+	// for both channel types (non-anchor and anchor channel).
+	type testCase struct {
+		name               string
+		channel            *LightningChannel
+		maxFeeAlloc        float64
+		networkFeeRate     chainfee.SatPerKWeight
+		minRelayFee        chainfee.SatPerKWeight
+		maxAnchorCommitFee chainfee.SatPerKWeight
+		expectedFeeRate    chainfee.SatPerKWeight
+	}
+
+	nonAnchorCases := []testCase{
+		{
+			name: "ideal fee rate capped at the max " +
+				"available fee rate which is smaller than " +
+				"the network fee rate",
+			channel:        nonAnchorChannel,
+			networkFeeRate: 7e8,
+			maxFeeAlloc:    1.0,
+			// There is not enough balance to pay the network fee so
+			// the maximum available fee rate is expected.
+			expectedFeeRate: maxFeeRate(nonAnchorChannel, 1.0),
+		},
+		{
+			name: "enough balance for the ideal network " +
+				"fee rate",
+			channel:         nonAnchorChannel,
+			networkFeeRate:  5e8,
+			maxFeeAlloc:     1.0,
+			expectedFeeRate: 5e8,
+		},
+		{
+			name: "min relay fee rate is greater than " +
+				"the ideal network fee rate",
+			channel:        nonAnchorChannel,
+			networkFeeRate: 5e8,
+			maxFeeAlloc:    1.0,
+			minRelayFee:    6e8,
+			// The min relay fee rate is used as ideal fee rate
+			// because we can afford it and it's greater than the
+			// network fee rate.
+			expectedFeeRate: 6e8,
+		},
+		{
+			name: "max available fee rate is smaller than the " +
+				"min relay fee rate",
+			channel:        nonAnchorChannel,
+			networkFeeRate: 8e8,
+			maxFeeAlloc:    1e-3,
+			minRelayFee:    7e8,
+			// Using 100% of the available balance (fee alloc) for
+			// the fee rate but this is still not enough to pay for
+			// the min relay fee rate.
+			expectedFeeRate: maxFeeRate(nonAnchorChannel, 1.0),
+		},
+		{
+			name: "current fee rate of the channel is used as a" +
+				"fee floor because fee alloc is too small " +
+				"(fee ratcheting)",
+			channel:        nonAnchorChannel,
+			networkFeeRate: 8e8,
+			maxFeeAlloc:    1e-7,
+			// The fee allocation is too small so we floor the ideal
+			// fee rate at the current fee rate of the channel.
+			expectedFeeRate: currentFeeRate(anchorChannel),
+		},
+	}
+
+	anchorCases := []testCase{
+		{
+			name: "fee rate is capped at the max anchor commit " +
+				"fee rate, which is equal to the fee floor",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        0.1,
+			maxAnchorCommitFee: chainfee.FeePerKwFloor,
+			expectedFeeRate:    chainfee.FeePerKwFloor,
+		},
+		{
+			name: "fee rate capped at the max anchor commit fee " +
+				"rate",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-6,
+			maxAnchorCommitFee: 700,
+			expectedFeeRate:    700,
+		},
+		{
+			name: "fee rate is capped at the max commit anchor" +
+				"fee rate",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-3,
+			maxAnchorCommitFee: 1e5,
+			expectedFeeRate:    1e5,
+		},
+		{
+			name: "min relay fee rate is used when " +
+				"the max commit anchor fee rate is smaller",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-4,
+			minRelayFee:        4e5,
+			maxAnchorCommitFee: 3e5,
+			expectedFeeRate:    4e5,
+		},
+		{
+			name: "min relay fee rate is used when " +
+				"we can still can pay for it using 100% of " +
+				"our balance neglecting the initial fee alloc",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-3,
+			minRelayFee:        5e5,
+			maxAnchorCommitFee: 3e5,
+			expectedFeeRate:    5e5,
+		},
+		{
+			name: "max fee rate using 100% of our balance, " +
+				"neglecting the initial fee alloc, but still " +
+				"not able to account for the min relay fee " +
+				"rate",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-3,
+			minRelayFee:        4.5e8,
+			maxAnchorCommitFee: 3e5,
+			// This is the absolute maximum balance which can be
+			// used for the commitment fee.
+			expectedFeeRate: maxFeeRate(anchorChannel, 1.0),
+		},
+		{
+			name: "current fee rate of the " +
+				"commitment channel is used as the max " +
+				"commit anchor fee rate because the fee " +
+				"alloc. is too small (fee ratcheting)",
+			channel:            anchorChannel,
+			networkFeeRate:     7e8,
+			maxFeeAlloc:        1e-7,
+			maxAnchorCommitFee: 1e6,
+			expectedFeeRate:    currentFeeRate(anchorChannel),
+		},
+	}
+
+	assertIdealFeeRate := func(c *LightningChannel, netFee, minRelay,
+		maxAnchorCommit chainfee.SatPerKWeight,
+		maxFeeAlloc float64, expectedFeeRate chainfee.SatPerKWeight) {
+
+		feeRate := c.IdealCommitFeeRate(
+			netFee, minRelay, maxAnchorCommit, maxFeeAlloc,
+		)
+
+		// Due to rounding inaccuracies when calculating the fee rate a
+		// relative error of 0.1% is tolerated.
+		require.InEpsilonf(
+			t, float64(expectedFeeRate), float64(feeRate),
+			1e-3, "expected max fee rate:%d, got max "+
+				"fee rate :%d", currentFeeRate,
+			maxFeeRate,
+		)
+
+		if err := c.validateFeeRate(feeRate); err != nil {
+			t.Fatalf("fee rate validation failed: %v", err)
+		}
+	}
+
 	t.Run("non-anchor-channel", func(t *testing.T) {
-		aliceChannel, _, err := CreateTestChannels(
-			t, channeldb.SingleFunderTweaklessBit,
-		)
-		if err != nil {
-			t.Fatalf("unable to create test channels: %v", err)
+		for _, testCase := range nonAnchorCases {
+			tc := testCase
+
+			assertIdealFeeRate(
+				tc.channel, tc.networkFeeRate, tc.minRelayFee,
+				tc.maxAnchorCommitFee, tc.maxFeeAlloc,
+				tc.expectedFeeRate,
+			)
 		}
-
-		err = quick.Check(propertyTest(aliceChannel), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// If the maximum fee is lower than the network fee and above
-		// the min relay fee, use the maximum fee.
-		assertIdealFeeRate(
-			aliceChannel, 700000000, 0, 0, 1.0, 676794154,
-		)
-
-		// If the network fee is lower than the max fee and above the
-		// min relay fee, use the network fee.
-		assertIdealFeeRate(
-			aliceChannel, 500000000, 0, 0, 1.0, 500000000,
-		)
-
-		// If the fee is below the minimum relay fee, and the min relay
-		// fee is less than our max fee, use the minimum relay fee.
-		assertIdealFeeRate(
-			aliceChannel, 500000000, 600000000, 0, 1.0, 600000000,
-		)
-
-		// The absolute maximum fee rate we can pay (ie, using a max
-		// allocation of 1) is still below the minimum relay fee. In
-		// this case, use the absolute max fee.
-		assertIdealFeeRate(
-			aliceChannel, 800000000, 700000000, 0, 0.001,
-			676794154,
-		)
 	})
 
-	// Test ideal fee rates for an anchor channel
 	t.Run("anchor-channel", func(t *testing.T) {
-		anchorChannel, _, err := CreateTestChannels(
-			t, channeldb.SingleFunderTweaklessBit|
-				channeldb.AnchorOutputsBit|
-				channeldb.ZeroHtlcTxFeeBit,
-		)
-		if err != nil {
-			t.Fatalf("unable to create test channels: %v", err)
+		for _, testCase := range anchorCases {
+			tc := testCase
+
+			assertIdealFeeRate(
+				tc.channel, tc.networkFeeRate, tc.minRelayFee,
+				tc.maxAnchorCommitFee, tc.maxFeeAlloc,
+				tc.expectedFeeRate,
+			)
 		}
-
-		err = quick.Check(propertyTest(anchorChannel), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Anchor commitments are heavier, hence the same allocation
-		// leads to slightly lower fee rates.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 0, chainfee.FeePerKwFloor,
-			0.1, chainfee.FeePerKwFloor,
-		)
-
-		// If the maximum fee is lower than the network fee, use the
-		// maximum fee.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 0, 1000000, 0.001, 435941,
-		)
-
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 0, 700, 0.000001, 435,
-		)
-
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 0, 1000000, 0.0000001,
-			chainfee.FeePerKwFloor,
-		)
-
-		// If the maximum anchor commit fee rate is less than the
-		// maximum fee, use the max anchor commit fee since this is an
-		// anchor channel.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 0, 400000, 0.001, 400000,
-		)
-
-		// If the minimum relay fee is above the max anchor commitment
-		// fee rate but still below our max fee rate then use the min
-		// relay fee.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 400000, 300000, 0.001,
-			400000,
-		)
-
-		// If the min relay fee is above the ideal max fee rate but is
-		// below the max fee rate when the max fee allocation is set to
-		// 1, the minimum relay fee is used.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 500000, 300000, 0.001,
-			500000,
-		)
-
-		// The absolute maximum fee rate we can pay (ie, using a max
-		// allocation of 1) is still below the minimum relay fee. In
-		// this case, use the absolute max fee.
-		assertIdealFeeRate(
-			anchorChannel, 700000000, 450000000, 300000, 0.001,
-			435941555,
-		)
 	})
 }
 
@@ -7756,11 +7985,11 @@ func TestChannelFeeRateFloor(t *testing.T) {
 // TestFetchParent tests lookup of an entry's parent in the appropriate log.
 func TestFetchParent(t *testing.T) {
 	tests := []struct {
-		name          string
-		remoteChain   bool
-		remoteLog     bool
-		localEntries  []*PaymentDescriptor
-		remoteEntries []*PaymentDescriptor
+		name             string
+		whoseCommitChain lntypes.ChannelParty
+		whoseUpdateLog   lntypes.ChannelParty
+		localEntries     []*PaymentDescriptor
+		remoteEntries    []*PaymentDescriptor
 
 		// parentIndex is the parent index of the entry that we will
 		// lookup with fetch parent.
@@ -7774,22 +8003,22 @@ func TestFetchParent(t *testing.T) {
 		expectedIndex uint64
 	}{
 		{
-			name:          "not found in remote log",
-			localEntries:  nil,
-			remoteEntries: nil,
-			remoteChain:   true,
-			remoteLog:     true,
-			parentIndex:   0,
-			expectErr:     true,
+			name:             "not found in remote log",
+			localEntries:     nil,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      0,
+			expectErr:        true,
 		},
 		{
-			name:          "not found in local log",
-			localEntries:  nil,
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   0,
-			expectErr:     true,
+			name:             "not found in local log",
+			localEntries:     nil,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      0,
+			expectErr:        true,
 		},
 		{
 			name:         "remote log + chain, remote add height 0",
@@ -7809,10 +8038,10 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 0,
 				},
 			},
-			remoteChain: true,
-			remoteLog:   true,
-			parentIndex: 1,
-			expectErr:   true,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name: "remote log, local chain, local add height 0",
@@ -7831,11 +8060,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			localEntries: nil,
-			remoteChain:  false,
-			remoteLog:    true,
-			parentIndex:  1,
-			expectErr:    true,
+			localEntries:     nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name: "local log + chain, local add height 0",
@@ -7854,11 +8083,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     true,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 
 		{
@@ -7878,11 +8107,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 0,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   true,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     true,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name:         "remote log found",
@@ -7902,11 +8131,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteChain:   true,
-			remoteLog:     true,
-			parentIndex:   1,
-			expectErr:     false,
-			expectedIndex: 2,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        false,
+			expectedIndex:    2,
 		},
 		{
 			name: "local log found",
@@ -7925,12 +8154,12 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     false,
-			expectedIndex: 2,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        false,
+			expectedIndex:    2,
 		},
 	}
 
@@ -7957,8 +8186,8 @@ func TestFetchParent(t *testing.T) {
 				&PaymentDescriptor{
 					ParentIndex: test.parentIndex,
 				},
-				test.remoteChain,
-				test.remoteLog,
+				test.whoseCommitChain,
+				test.whoseUpdateLog,
 			)
 			gotErr := err != nil
 			if test.expectErr != gotErr {
@@ -8016,11 +8245,11 @@ func TestEvaluateView(t *testing.T) {
 	)
 
 	tests := []struct {
-		name        string
-		ourHtlcs    []*PaymentDescriptor
-		theirHtlcs  []*PaymentDescriptor
-		remoteChain bool
-		mutateState bool
+		name             string
+		ourHtlcs         []*PaymentDescriptor
+		theirHtlcs       []*PaymentDescriptor
+		whoseCommitChain lntypes.ChannelParty
+		mutateState      bool
 
 		// ourExpectedHtlcs is the set of our htlcs that we expect in
 		// the htlc view once it has been evaluated. We just store
@@ -8047,9 +8276,9 @@ func TestEvaluateView(t *testing.T) {
 		expectSent lnwire.MilliSatoshi
 	}{
 		{
-			name:        "our fee update is applied",
-			remoteChain: false,
-			mutateState: false,
+			name:             "our fee update is applied",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					Amount:    ourFeeUpdateAmt,
@@ -8064,10 +8293,10 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:         0,
 		},
 		{
-			name:        "their fee update is applied",
-			remoteChain: false,
-			mutateState: false,
-			ourHtlcs:    []*PaymentDescriptor{},
+			name:             "their fee update is applied",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
+			ourHtlcs:         []*PaymentDescriptor{},
 			theirHtlcs: []*PaymentDescriptor{
 				{
 					Amount:    theirFeeUpdateAmt,
@@ -8082,9 +8311,9 @@ func TestEvaluateView(t *testing.T) {
 		},
 		{
 			// We expect unresolved htlcs to to remain in the view.
-			name:        "htlcs adds without settles",
-			remoteChain: false,
-			mutateState: false,
+			name:             "htlcs adds without settles",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8116,9 +8345,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "our htlc settled, state mutated",
-			remoteChain: false,
-			mutateState: true,
+			name:             "our htlc settled, state mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      true,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex:            0,
@@ -8151,9 +8380,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     htlcAddAmount,
 		},
 		{
-			name:        "our htlc settled, state not mutated",
-			remoteChain: false,
-			mutateState: false,
+			name:             "our htlc settled, state not mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex:            0,
@@ -8186,9 +8415,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "their htlc settled, state mutated",
-			remoteChain: false,
-			mutateState: true,
+			name:             "their htlc settled, state mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      true,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8229,9 +8458,10 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "their htlc settled, state not mutated",
-			remoteChain: false,
-			mutateState: false,
+			name: "their htlc settled, state not mutated",
+
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8314,7 +8544,7 @@ func TestEvaluateView(t *testing.T) {
 			// Evaluate the htlc view, mutate as test expects.
 			result, err := lc.evaluateHTLCView(
 				view, &ourBalance, &theirBalance, nextHeight,
-				test.remoteChain, test.mutateState,
+				test.whoseCommitChain, test.mutateState,
 			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -8402,12 +8632,12 @@ func TestProcessFeeUpdate(t *testing.T) {
 	)
 
 	tests := []struct {
-		name            string
-		startHeights    heights
-		expectedHeights heights
-		remoteChain     bool
-		mutate          bool
-		expectedFee     chainfee.SatPerKWeight
+		name             string
+		startHeights     heights
+		expectedHeights  heights
+		whoseCommitChain lntypes.ChannelParty
+		mutate           bool
+		expectedFee      chainfee.SatPerKWeight
 	}{
 		{
 			// Looking at local chain, local add is non-zero so
@@ -8425,9 +8655,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: height,
 			},
-			remoteChain: false,
-			mutate:      false,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Local,
+			mutate:           false,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Looking at local chain, local add is zero so the
@@ -8446,9 +8676,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    height,
 				remoteRemove: 0,
 			},
-			remoteChain: false,
-			mutate:      false,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Local,
+			mutate:           false,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 		{
 			// Looking at remote chain, the remote add height is
@@ -8467,9 +8697,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: 0,
 			},
-			remoteChain: true,
-			mutate:      false,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Remote,
+			mutate:           false,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 		{
 			// Looking at remote chain, the remote add height is
@@ -8488,9 +8718,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    height,
 				remoteRemove: 0,
 			},
-			remoteChain: true,
-			mutate:      false,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Remote,
+			mutate:           false,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Local add height is non-zero, so the update has
@@ -8509,9 +8739,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: height,
 			},
-			remoteChain: false,
-			mutate:      true,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Local,
+			mutate:           true,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Local add is zero and we are looking at our local
@@ -8531,9 +8761,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: 0,
 			},
-			remoteChain: false,
-			mutate:      true,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Local,
+			mutate:           true,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 	}
 
@@ -8557,7 +8787,7 @@ func TestProcessFeeUpdate(t *testing.T) {
 				feePerKw: chainfee.SatPerKWeight(feePerKw),
 			}
 			processFeeUpdate(
-				update, nextHeight, test.remoteChain,
+				update, nextHeight, test.whoseCommitChain,
 				test.mutate, view,
 			)
 
@@ -8612,7 +8842,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 	tests := []struct {
 		name                 string
 		startHeights         heights
-		remoteChain          bool
+		whoseCommitChain     lntypes.ChannelParty
 		isIncoming           bool
 		mutateState          bool
 		ourExpectedBalance   lnwire.MilliSatoshi
@@ -8628,7 +8858,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8649,7 +8879,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8670,7 +8900,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8691,7 +8921,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance,
@@ -8713,7 +8943,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance - updateAmount,
@@ -8734,7 +8964,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance - updateAmount,
@@ -8755,7 +8985,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: removeHeight,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8776,7 +9006,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  removeHeight,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8799,7 +9029,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -8822,7 +9052,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8845,7 +9075,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8868,7 +9098,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -8893,7 +9123,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -8918,7 +9148,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -8967,7 +9197,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 
 			process(
 				update, &ourBalance, &theirBalance, nextHeight,
-				test.remoteChain, test.isIncoming,
+				test.whoseCommitChain, test.isIncoming,
 				test.mutateState,
 			)
 
@@ -9522,9 +9752,13 @@ func testGetDustSum(t *testing.T, chantype channeldb.ChannelType) {
 	checkDust := func(c *LightningChannel, expLocal,
 		expRemote lnwire.MilliSatoshi) {
 
-		localDustSum := c.GetDustSum(false)
+		localDustSum := c.GetDustSum(
+			lntypes.Local, fn.None[chainfee.SatPerKWeight](),
+		)
 		require.Equal(t, expLocal, localDustSum)
-		remoteDustSum := c.GetDustSum(true)
+		remoteDustSum := c.GetDustSum(
+			lntypes.Remote, fn.None[chainfee.SatPerKWeight](),
+		)
 		require.Equal(t, expRemote, remoteDustSum)
 	}
 
@@ -9677,8 +9911,9 @@ func deriveDummyRetributionParams(chanState *channeldb.OpenChannel) (uint32,
 	config := chanState.RemoteChanCfg
 	commitHash := chanState.RemoteCommitment.CommitTx.TxHash()
 	keyRing := DeriveCommitmentKeys(
-		config.RevocationBasePoint.PubKey, false, chanState.ChanType,
-		&chanState.LocalChanCfg, &chanState.RemoteChanCfg,
+		config.RevocationBasePoint.PubKey, lntypes.Remote,
+		chanState.ChanType, &chanState.LocalChanCfg,
+		&chanState.RemoteChanCfg,
 	)
 	leaseExpiry := chanState.ThawHeight
 	return leaseExpiry, keyRing, commitHash
@@ -10110,4 +10345,730 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 		aliceChannel.channelState, stateNum+1, breachHeight, nil,
 	)
 	require.ErrorIs(t, err, channeldb.ErrLogEntryNotFound)
+}
+
+// TestExtractPayDescs asserts that `extractPayDescs` can correctly turn a
+// slice of htlcs into two slices of PaymentDescriptors.
+func TestExtractPayDescs(t *testing.T) {
+	t.Parallel()
+
+	// Create a testing LightningChannel.
+	lnChan, _, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	// Create two incoming HTLCs.
+	incomings := []channeldb.HTLC{
+		createRandomHTLC(t, true),
+		createRandomHTLC(t, true),
+	}
+
+	// Create two outgoing HTLCs.
+	outgoings := []channeldb.HTLC{
+		createRandomHTLC(t, false),
+		createRandomHTLC(t, false),
+	}
+
+	// Concatenate incomings and outgoings into a single slice.
+	htlcs := []channeldb.HTLC{}
+	htlcs = append(htlcs, incomings...)
+	htlcs = append(htlcs, outgoings...)
+
+	// Run the method under test.
+	//
+	// NOTE: we use nil commitment key rings to avoid checking the htlc
+	// scripts(`genHtlcScript`) as it should be tested independently.
+	incomingPDs, outgoingPDs, err := lnChan.extractPayDescs(
+		0, 0, htlcs, nil, nil, lntypes.Local,
+	)
+	require.NoError(t, err)
+
+	// Assert the incoming PaymentDescriptors are matched.
+	for i, pd := range incomingPDs {
+		htlc := incomings[i]
+		assertPayDescMatchHTLC(t, pd, htlc)
+	}
+
+	// Assert the outgoing PaymentDescriptors are matched.
+	for i, pd := range outgoingPDs {
+		htlc := outgoings[i]
+		assertPayDescMatchHTLC(t, pd, htlc)
+	}
+}
+
+// assertPayDescMatchHTLC compares a PaymentDescriptor to a channeldb.HTLC and
+// asserts that the fields are matched.
+func assertPayDescMatchHTLC(t *testing.T, pd PaymentDescriptor,
+	htlc channeldb.HTLC) {
+
+	require := require.New(t)
+
+	require.EqualValues(htlc.RHash, pd.RHash, "RHash")
+	require.Equal(htlc.RefundTimeout, pd.Timeout, "Timeout")
+	require.Equal(htlc.Amt, pd.Amount, "Amount")
+	require.Equal(htlc.HtlcIndex, pd.HtlcIndex, "HtlcIndex")
+	require.Equal(htlc.LogIndex, pd.LogIndex, "LogIndex")
+	require.EqualValues(htlc.OnionBlob[:], pd.OnionBlob, "OnionBlob")
+}
+
+// createRandomHTLC creates an HTLC that has random value in every field except
+// the `Incoming`.
+func createRandomHTLC(t *testing.T, incoming bool) channeldb.HTLC {
+	var onionBlob [lnwire.OnionPacketSize]byte
+	_, err := rand.Read(onionBlob[:])
+	require.NoError(t, err)
+
+	var rHash [lntypes.HashSize]byte
+	_, err = rand.Read(rHash[:])
+	require.NoError(t, err)
+
+	sig := make([]byte, 64)
+	_, err = rand.Read(sig)
+	require.NoError(t, err)
+
+	blinding, err := pubkeyFromHex(
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+	)
+	require.NoError(t, err)
+
+	return channeldb.HTLC{
+		Signature:     sig,
+		RHash:         rHash,
+		Amt:           lnwire.MilliSatoshi(rand.Uint64()),
+		RefundTimeout: rand.Uint32(),
+		OutputIndex:   rand.Int31n(1000),
+		Incoming:      incoming,
+		OnionBlob:     onionBlob,
+		HtlcIndex:     rand.Uint64(),
+		LogIndex:      rand.Uint64(),
+		BlindingPoint: tlv.SomeRecordT(
+			//nolint:lll
+			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](blinding),
+		),
+	}
+}
+
+// TestApplyCommitmentFee tests that depending on the buffer type the correct
+// commitment fee is calculated which includes the buffer amount which will be
+// kept and is not usable hence not considered part of the usable local balance.
+func TestApplyCommitmentFee(t *testing.T) {
+	var (
+		balance = lnwire.NewMSatFromSatoshis(5_000_000)
+
+		// balance used to test the case where the commitment fee
+		// including the buffer is greater than the balance.
+		balanceBelowReserve = lnwire.NewMSatFromSatoshis(5_000)
+
+		// commitment weight with an additional htlc.
+		commitWeight lntypes.WeightUnit = input.
+				BaseAnchorCommitmentTxWeight + input.HTLCWeight
+
+		// fee rate of 10 sat/vbyte.
+		feePerKw  = chainfee.SatPerKWeight(2500)
+		commitFee = lnwire.NewMSatFromSatoshis(
+			feePerKw.FeeForWeight(commitWeight),
+		)
+		additionalHtlc = lnwire.NewMSatFromSatoshis(
+			feePerKw.FeeForWeight(input.HTLCWeight),
+		)
+		feeBuffer = CalcFeeBuffer(feePerKw, commitWeight)
+	)
+
+	// Create test channels so that we can use the `applyCommitFee`
+	// function.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name              string
+		channel           *LightningChannel
+		buffer            BufferType
+		balance           lnwire.MilliSatoshi
+		expectedBalance   lnwire.MilliSatoshi
+		expectedBufferAmt lnwire.MilliSatoshi
+		bufferAmt         lnwire.MilliSatoshi
+		expectedErr       error
+	}{
+		{
+			name:              "apply feebuffer local initiator",
+			channel:           aliceChannel,
+			buffer:            FeeBuffer,
+			balance:           balance,
+			expectedBalance:   balance - feeBuffer,
+			expectedBufferAmt: feeBuffer - commitFee,
+		},
+		{
+			name:        "apply feebuffer remote initiator",
+			channel:     bobChannel,
+			buffer:      FeeBuffer,
+			balance:     balance,
+			expectedErr: ErrFeeBufferNotInitiator,
+		},
+		{
+			name:              "apply AdditionalHtlc buffer",
+			channel:           aliceChannel,
+			buffer:            AdditionalHtlc,
+			balance:           balance,
+			expectedBalance:   balance - commitFee - additionalHtlc,
+			expectedBufferAmt: additionalHtlc,
+		},
+		{
+			name:              "apply NoBuffer",
+			channel:           aliceChannel,
+			buffer:            NoBuffer,
+			balance:           balance,
+			expectedBalance:   balance - commitFee,
+			expectedBufferAmt: 0,
+		},
+		{
+			name:              "apply FeeBuffer balance negative",
+			channel:           aliceChannel,
+			buffer:            FeeBuffer,
+			balance:           balanceBelowReserve,
+			expectedBalance:   balanceBelowReserve,
+			expectedErr:       ErrBelowChanReserve,
+			expectedBufferAmt: feeBuffer,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			balance, bufferAmt, err := tc.channel.applyCommitFee(
+				tc.balance, commitWeight, feePerKw, tc.buffer)
+
+			require.ErrorIs(t, err, tc.expectedErr)
+			require.Equal(t, tc.expectedBalance, balance)
+			require.Equal(t, tc.expectedBufferAmt, bufferAmt)
+		})
+	}
+}
+
+// TestAsynchronousSendingContraint tests that when both peers add htlcs to
+// their commitment asynchronously and the channel opener does not account for
+// an additional buffer locally an unusable channel state can be the worst case
+// consequence when the channel is locally drained.
+// NOTE: This edge case can only be solved at the protocol level because
+// currently both parties can add htlcs to their commitments in simultaneously
+// which can lead to a situation where the channel opener cannot pay the fees
+// for the additional htlc outputs which were added in parallel. A solution for
+// this can either be a fee buffer or a new protocol improvement called
+// __option_simplified_update__.
+//
+// The full state transition of this test is:
+// The vertical mark in the middle is the connection which separates alice and
+// bob. When a line only goes to this mark it means the signal was only added
+// to one side of the channel parties.
+//
+//
+// Alice                  		Bob
+//			|
+// 	-----add------>	|
+// 			|<----add-------
+//	Add htlcs asynchronously.
+// 	<----add------- |
+// 			|-----add------>
+//	<----sig-------	|---------------
+//	-----rev------>	|
+//	-----sig------>	|
+// 	(Alice fails with ErrBelowChanReserve)
+
+func TestAsynchronousSendingContraint(t *testing.T) {
+	t.Parallel()
+
+	// Create test channels to test out this state transition. The channel
+	// capactiy is 10 BTC with every side having 5 BTC at start. The fee
+	// rate is static and 6000 sats/kw.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	aliceReserve := aliceChannel.channelState.LocalChanCfg.ChanReserve
+
+	capacity := aliceChannel.channelState.Capacity
+
+	// Static fee rate of 6000 sats/kw.
+	feePerKw := chainfee.SatPerKWeight(
+		aliceChannel.channelState.LocalCommitment.FeePerKw,
+	)
+
+	additionalHtlc := feePerKw.FeeForWeight(input.HTLCWeight)
+	commitFee := feePerKw.FeeForWeight(input.CommitWeight)
+
+	// We add an htlc to alice commitment with the amount so that everything
+	// will be used up and the remote party cannot add another htlc because
+	// alice (the opener of the channel) will not be able to afford the
+	// additional onchain cost of the htlc output on the commitment tx.
+	htlcAmount := capacity/2 - aliceReserve - commitFee - additionalHtlc
+
+	// Create an HTLC that alice will send to Bob which let's alice use up
+	// all its local funds.
+	// -----add------>|
+	htlc1, _ := createHTLC(0, lnwire.NewMSatFromSatoshis(htlcAmount))
+	_, err = aliceChannel.addHTLC(htlc1, nil, NoBuffer)
+	require.NoError(t, err)
+
+	// Before making bob aware of this new htlc, let bob add an HTLC on the
+	// commitment as well. Because bob does not know yet about the htlc
+	// alice is going to add to the state his adding will succeed as well.
+
+	// |<----add-------
+	// make sure this htlc is non-dust for alice.
+	htlcFee := HtlcSuccessFee(channeldb.SingleFunderTweaklessBit, feePerKw)
+	// We need to take the remote dustlimit amount, because it the greater
+	// one.
+	htlcAmt2 := lnwire.NewMSatFromSatoshis(
+		aliceChannel.channelState.RemoteChanCfg.DustLimit + htlcFee,
+	)
+	htlc2, _ := createHTLC(0, htlcAmt2)
+
+	// We could also use AddHTLC here because bob is not the initiator but
+	// we stay consistent in this test and use addHTLC instead.
+	_, err = bobChannel.addHTLC(htlc2, nil, NoBuffer)
+	require.NoError(t, err)
+
+	// Now lets both channel parties know about these new htlcs.
+	// <----add-------|
+	// 		  |-----add------>
+	_, err = aliceChannel.ReceiveHTLC(htlc2)
+	require.NoError(t, err)
+	_, err = bobChannel.ReceiveHTLC(htlc1)
+	require.NoError(t, err)
+
+	// Bob signs the new state for alice, which ONLY has his htlc on it
+	// because he only includes acked updates of alice.
+	// <----sig-------|---------------
+	bobNewCommit, err := bobChannel.SignNextCommitment()
+	require.NoError(t, err)
+
+	err = aliceChannel.ReceiveNewCommitment(bobNewCommit.CommitSigs)
+	require.NoError(t, err)
+
+	// Alice revokes her local commitment which will lead her to include
+	// Bobs htlc into the commitment when signing the new state for bob.
+	// -----rev------>|
+	_, _, _, err = aliceChannel.RevokeCurrentCommitment()
+	require.NoError(t, err)
+
+	// Because alice revoked her local commitment she will now include bob's
+	// incoming htlc in her commitment sig to bob, but this will dip her
+	// local balance below her reserve because she already used everything
+	// up when adding her htlc.
+	_, err = aliceChannel.SignNextCommitment()
+	require.ErrorIs(t, err, ErrBelowChanReserve)
+}
+
+// TestAsynchronousSendingWithFeeBuffer tests that in case of asynchronous
+// adding of htlcs to the channel state a fee buffer will prevent the channel
+// from becoming unusable because the channel opener will always keep an
+// additional buffer to account either for fee updates or for the asynchronous
+// adding of htlcs from both parties.
+// The full state transition of this test is:
+// The vertical mark in the middle is the connection which separates alice and
+// bob. When a line only goes to this mark it means the signal was only added
+// to one side of the channel parties.
+//
+// Alice 		                Bob
+// (keeps a feeBuffer)
+//
+//			|
+//	-----add------>	|
+//			|<----add-------
+//			|
+//	<----add------- |
+//			|-----add------>
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+// 	alice's htlc is locked-in bob
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+// 	bob's htlc is locked-in for alice
+//	---------------	|-----fail----->
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+// 	bob's htlc is failed now.
+//	use the fee buffer to increase
+// 	the fee of the commitment tx:
+//	---------------	|----updFee---->
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+// 	let bob add another htlc:
+//	<----add------- |<--------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+
+func TestAsynchronousSendingWithFeeBuffer(t *testing.T) {
+	t.Parallel()
+
+	// Create test channels to test out this state transition. The channel
+	// capactiy is 10 BTC with every side having 5 BTC at start. The fee
+	// rate is static and 6000 sats/kw.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	aliceReserve := aliceChannel.channelState.LocalChanCfg.ChanReserve
+
+	capacity := aliceChannel.channelState.Capacity
+
+	// Static fee rate of 6000 sats/kw.
+	feePerKw := chainfee.SatPerKWeight(
+		aliceChannel.channelState.LocalCommitment.FeePerKw,
+	)
+
+	// Calculate the fee buffer for the current commitment tx including
+	// the htlc we are going to add to alice's commitment tx.
+	feeBuffer := CalcFeeBuffer(
+		feePerKw, input.CommitWeight+input.HTLCWeight,
+	)
+
+	htlcAmount := capacity/2 - aliceReserve - feeBuffer.ToSatoshis()
+
+	// Create an HTLC that alice will send to bob which uses all the local
+	// balance except the fee buffer (including the commitment fee) and the
+	// channel reserve.
+	htlc1, _ := createHTLC(0, lnwire.NewMSatFromSatoshis(htlcAmount))
+
+	// Add this HTLC only to alice channel for now only including a fee
+	// buffer.
+	// -----add------>|
+	_, err = aliceChannel.AddHTLC(htlc1, nil)
+	require.NoError(t, err)
+
+	// Before making bob aware of this new htlc, let bob add an HTLC on the
+	// commitment as well.
+	// |<----add-------
+	// make sure this htlc is non-dust for alice.
+	htlcFee := HtlcSuccessFee(channeldb.SingleFunderTweaklessBit, feePerKw)
+	htlcAmt2 := lnwire.NewMSatFromSatoshis(
+		aliceChannel.channelState.LocalChanCfg.DustLimit + htlcFee,
+	)
+	htlc2, _ := createHTLC(0, htlcAmt2)
+	_, err = bobChannel.AddHTLC(htlc2, nil)
+	require.NoError(t, err)
+
+	// Now lets both channel parties know about these new htlcs.
+	// 	<----add-------	|
+	// 			|-----add------>
+	_, err = aliceChannel.ReceiveHTLC(htlc2)
+	require.NoError(t, err)
+	_, err = bobChannel.ReceiveHTLC(htlc1)
+	require.NoError(t, err)
+
+	// Now force the state transisiton. Both sides will succeed although
+	// we added htlcs asynchronously because we kept a buffer on alice side
+	// We start the state transition with alice.
+	// Force a state transition, this will lock-in the htlc of alice.
+	// -----sig-----> (includes alice htlc)
+	// <----rev------
+	// <----sig------ (includes alice and bobs htlc)
+	// -----rev-----> (locks in alice's htlc for bob)
+	// bob's htlc is still not fully locked in.
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	// Force a state transition, this will lock-in the htlc of bob.
+	// ------sig-----> (includes bob's htlc)
+	// <----rev------ (locks in bob's htlc for alice)
+	aliceNewCommit, err := aliceChannel.SignNextCommitment()
+	require.NoError(t, err)
+	err = bobChannel.ReceiveNewCommitment(aliceNewCommit.CommitSigs)
+	require.NoError(t, err)
+
+	bobRevocation, _, _, err := bobChannel.RevokeCurrentCommitment()
+	require.NoError(t, err)
+	_, _, _, _, err = aliceChannel.ReceiveRevocation(bobRevocation)
+	require.NoError(t, err)
+
+	// Before testing the behavior of the fee buffer, we are going to fail
+	// back bob's htlc so that we only have 1 htlc on the commitment tx
+	// (alice htlc to bob) this makes it possible to exactly increase the
+	// fee of the commitment by 100%.
+	//	---------------	|-----fail----->
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	err = aliceChannel.FailHTLC(0, []byte{}, nil, nil, nil)
+	require.NoError(t, err)
+
+	err = bobChannel.ReceiveFailHTLC(0, []byte{})
+	require.NoError(t, err)
+
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	// Use the fee buffer to react to a potential fee rate increase and
+	// update the fee rate by 100%.
+	//	---------------	|----updFee---->
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	err = aliceChannel.UpdateFee(feePerKw * 2)
+	require.NoError(t, err)
+
+	err = bobChannel.ReceiveUpdateFee(feePerKw * 2)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	// Now let bob add an htlc to the commitment tx and make sure that
+	// despite the fee update bob can still add an htlc and alice still
+	// reserved funds for an additional htlc output on the commitment tx.
+	//	<----add------- |<--------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	// Update the non-dust amount because we updated the fee by 100%.
+	htlcFee = HtlcSuccessFee(channeldb.SingleFunderTweaklessBit, feePerKw*2)
+	htlcAmt3 := lnwire.NewMSatFromSatoshis(
+		aliceChannel.channelState.LocalChanCfg.DustLimit + htlcFee,
+	)
+	htlc3, _ := createHTLC(1, htlcAmt3)
+	_, err = bobChannel.AddHTLC(htlc3, nil)
+	require.NoError(t, err)
+
+	_, err = aliceChannel.ReceiveHTLC(htlc3)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(bobChannel, aliceChannel)
+	require.NoError(t, err)
+
+	// Adding an HTLC from Alice side should not be possible because
+	// all funds are used up, even dust amounts.
+	htlc4, _ := createHTLC(2, 100)
+	// First try adding this htlc which should fail because the FeeBuffer
+	// cannot be kept while sending this HTLC.
+	_, err = aliceChannel.AddHTLC(htlc4, nil)
+	require.ErrorIs(t, err, ErrBelowChanReserve)
+	// Even without enforcing the FeeBuffer we used all of our usable funds
+	// on this channel and cannot even add a dust-htlc.
+	_, err = aliceChannel.addHTLC(htlc4, nil, NoBuffer)
+	require.ErrorIs(t, err, ErrBelowChanReserve)
+
+	// All of alice's balance is used up in fees and htlcs so the local
+	// balance equals exactly the local reserve.
+	require.Equal(t, aliceChannel.channelState.LocalCommitment.LocalBalance,
+		lnwire.NewMSatFromSatoshis(aliceReserve))
+}
+
+// TestEnforceFeeBuffer tests that in case the channel initiator does NOT have
+// enough local balance to pay for the FeeBuffer, adding new HTLCs by the
+// initiator will fail. Receiving HTLCs will still work because no FeeBuffer is
+// enforced when receiving HTLCs.
+//
+// The full state transition of this test is:
+// The vertical mark in the middle is the connection which separates alice and
+// bob. When a line only goes to this mark it means the signal was only added
+// to one side of the channel parties.
+//
+// Alice 		                Bob
+// (keeps a feeBuffer)
+//
+//	--------------- |-----add------>
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+//	alice sends all usable funds to bob
+//	<----add------- |---------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	bob adds an HTLC to the channel
+//	-----add------> |
+//	adding another HTLC fails because
+//	the FeeBuffer cannot be paid.
+//	<----add------- |<--------------
+//	<----sig-------	|---------------
+//	---------------	|-----rev------>
+//	---------------	|-----sig------>
+//	<----rev-------	|---------------
+//	bob adds another HTLC to the channel,
+//	alice can still pay the fee for the
+//	new commitment tx.
+func TestEnforceFeeBuffer(t *testing.T) {
+	t.Parallel()
+
+	// Create test channels to test out this state transition. The channel
+	// capactiy is 10 BTC with every side having 5 BTC at start. The fee
+	// rate is static and 6000 sats/kw.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	aliceReserve := aliceChannel.channelState.LocalChanCfg.ChanReserve
+
+	capacity := aliceChannel.channelState.Capacity
+
+	// Static fee rate of 6000 sats/kw.
+	feePerKw := chainfee.SatPerKWeight(
+		aliceChannel.channelState.LocalCommitment.FeePerKw,
+	)
+
+	// Commitment Fee of the channel state (with  1 pending htlc).
+	commitFee := feePerKw.FeeForWeight(
+		input.CommitWeight + input.HTLCWeight,
+	)
+	commitFeeMsat := lnwire.NewMSatFromSatoshis(commitFee)
+
+	// Calculate the FeeBuffer for the current commitment tx (non-anchor)
+	// including the htlc alice is going to add to the commitment tx.
+	feeBuffer := CalcFeeBuffer(
+		feePerKw, input.CommitWeight+input.HTLCWeight,
+	)
+
+	// The bufferAmt is the FeeBuffer excluding the commitment fee.
+	bufferAmt := feeBuffer - commitFeeMsat
+
+	htlcAmt1 := capacity/2 - aliceReserve - feeBuffer.ToSatoshis()
+
+	// Create an HTLC that alice will send to bob which uses all the local
+	// balance except the fee buffer (including the commitment fee) and the
+	// channel reserve.
+	//	--------------- |-----add------>
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	htlc1, _ := createHTLC(0, lnwire.NewMSatFromSatoshis(htlcAmt1))
+
+	_, err = aliceChannel.AddHTLC(htlc1, nil)
+	require.NoError(t, err)
+	_, err = bobChannel.ReceiveHTLC(htlc1)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	// Now bob sends a 1 btc htlc to alice.
+	//	<----add------- |---------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	htlcAmt2 := lnwire.NewMSatFromSatoshis(btcutil.SatoshiPerBitcent)
+	htlc2, _ := createHTLC(0, htlcAmt2)
+
+	_, err = bobChannel.AddHTLC(htlc2, nil)
+	require.NoError(t, err)
+	_, err = aliceChannel.ReceiveHTLC(htlc2)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(bobChannel, aliceChannel)
+	require.NoError(t, err)
+
+	// Alice has the buffer amount left trying to send this amount will
+	// fail.
+	htlc3, _ := createHTLC(1, bufferAmt)
+
+	_, err = aliceChannel.AddHTLC(htlc3, nil)
+	require.ErrorIs(t, err, ErrBelowChanReserve)
+
+	// Now bob sends another 1 btc htlc to alice.
+	//	<----add------- |---------------
+	//	<----sig-------	|---------------
+	//	---------------	|-----rev------>
+	//	---------------	|-----sig------>
+	//	<----rev-------	|---------------
+	htlc4, _ := createHTLC(1, htlcAmt2)
+
+	_, err = bobChannel.AddHTLC(htlc4, nil)
+	require.NoError(t, err)
+	_, err = aliceChannel.ReceiveHTLC(htlc4)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(bobChannel, aliceChannel)
+	require.NoError(t, err)
+
+	// Check that alice has the expected local balance left.
+	aliceReserveMsat := lnwire.NewMSatFromSatoshis(aliceReserve)
+
+	// The bufferAmt has to pay for the 2 additional incoming htlcs added
+	// by bob.
+	feeHTLC := feePerKw.FeeForWeight(input.HTLCWeight)
+	feeHTLCMsat := lnwire.NewMSatFromSatoshis(feeHTLC)
+
+	aliceBalance := aliceReserveMsat + bufferAmt - 2*feeHTLCMsat
+	expectedAmt := aliceChannel.channelState.LocalCommitment.LocalBalance
+
+	require.Equal(t, aliceBalance, expectedAmt)
+}
+
+// TestBlindingPointPersistence tests persistence of blinding points attached
+// to htlcs across restarts.
+func TestBlindingPointPersistence(t *testing.T) {
+	// Create a test channel which will be used for the duration of this
+	// test. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	// Send a HTLC from Alice to Bob that has a blinding point populated.
+	htlc, _ := createHTLC(0, 100_000_000)
+	blinding, err := pubkeyFromHex(
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+	)
+	require.NoError(t, err)
+	htlc.BlindingPoint = tlv.SomeRecordT(
+		tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](blinding),
+	)
+
+	_, err = aliceChannel.AddHTLC(htlc, nil)
+
+	require.NoError(t, err)
+	_, err = bobChannel.ReceiveHTLC(htlc)
+	require.NoError(t, err)
+
+	// Now, Alice will send a new commitment to Bob, which will persist our
+	// pending HTLC to disk.
+	aliceCommit, err := aliceChannel.SignNextCommitment()
+	require.NoError(t, err, "unable to sign commitment")
+
+	// Restart alice to force fetching state from disk.
+	aliceChannel, err = restartChannel(aliceChannel)
+	require.NoError(t, err, "unable to restart alice")
+
+	// Assert that the blinding point is restored from disk.
+	remoteCommit := aliceChannel.remoteCommitChain.tip()
+	require.Len(t, remoteCommit.outgoingHTLCs, 1)
+	require.Equal(t, blinding,
+		remoteCommit.outgoingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
+
+	// Next, update bob's commitment and assert that we can still retrieve
+	// his incoming blinding point after restart.
+	err = bobChannel.ReceiveNewCommitment(aliceCommit.CommitSigs)
+	require.NoError(t, err, "bob unable to receive new commitment")
+
+	_, _, _, err = bobChannel.RevokeCurrentCommitment()
+	require.NoError(t, err, "bob unable to revoke current commitment")
+
+	bobChannel, err = restartChannel(bobChannel)
+	require.NoError(t, err, "unable to restart bob's channel")
+
+	// Assert that Bob is able to recover the blinding point from disk.
+	bobCommit := bobChannel.localCommitChain.tip()
+	require.Len(t, bobCommit.incomingHTLCs, 1)
+	require.Equal(t, blinding,
+		bobCommit.incomingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
 }

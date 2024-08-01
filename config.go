@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -38,11 +38,11 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/peersrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/signal"
-	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/tor"
 )
 
@@ -169,6 +169,17 @@ const (
 	defaultRSBackoff  = time.Second * 30
 	defaultRSAttempts = 1
 
+	// Set defaults for a health check which ensures that the leader
+	// election is functioning correctly. Although this check is off by
+	// default (as etcd leader election is only used in a clustered setup),
+	// we still set the default values so that the health check can be
+	// easily enabled with sane defaults. Note that by default we only run
+	// this check once, as it is critical for the node's operation.
+	defaultLeaderCheckInterval = time.Minute
+	defaultLeaderCheckTimeout  = time.Second * 5
+	defaultLeaderCheckBackoff  = time.Second * 5
+	defaultLeaderCheckAttempts = 1
+
 	// defaultRemoteMaxHtlcs specifies the default limit for maximum
 	// concurrent HTLCs the remote party may add to commitment transactions.
 	// This value can be overridden with --default-remote-max-htlcs.
@@ -285,7 +296,7 @@ var (
 type Config struct {
 	ShowVersion bool `short:"V" long:"version" description:"Display version information and exit"`
 
-	LndDir       string `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc."`
+	LndDir       string `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc. This option overwrites all other directory options."`
 	ConfigFile   string `short:"C" long:"configfile" description:"Path to configuration file"`
 	DataDir      string `short:"b" long:"datadir" description:"The directory to store lnd's data within"`
 	SyncFreelist bool   `long:"sync-freelist" description:"Whether the databases used within lnd should sync their freelist to disk. This is disabled by default resulting in improved memory performance during operation, but with an increase in startup time."`
@@ -346,12 +357,12 @@ type Config struct {
 	BlockingProfile int `long:"blockingprofile" description:"Used to enable a blocking profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every blocking event, and 0 including no events."`
 	MutexProfile    int `long:"mutexprofile" description:"Used to Enable a mutex profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every mutex event, and 0 including no events."`
 
-	UnsafeDisconnect   bool   `long:"unsafe-disconnect" description:"DEPRECATED: Allows the rpcserver to intentionally disconnect from peers with open channels. THIS FLAG WILL BE REMOVED IN 0.10.0"`
+	UnsafeDisconnect   bool   `long:"unsafe-disconnect" description:"DEPRECATED: Allows the rpcserver to intentionally disconnect from peers with open channels. THIS FLAG WILL BE REMOVED IN 0.10.0" hidden:"true"`
 	UnsafeReplay       bool   `long:"unsafe-replay" description:"Causes a link to replay the adds on its commitment txn after starting up, this enables testing of the sphinx replay logic."`
 	MaxPendingChannels int    `long:"maxpendingchannels" description:"The maximum number of incoming pending channels permitted per peer."`
 	BackupFilePath     string `long:"backupfilepath" description:"The target location of the channel backup file"`
 
-	FeeURL string `long:"feeurl" description:"Optional URL for external fee estimation. If no URL is specified, the method for fee estimation will depend on the chosen backend and network. Must be set for neutrino on mainnet."`
+	FeeURL string `long:"feeurl" description:"DEPRECATED: Use 'fee.url' option. Optional URL for external fee estimation. If no URL is specified, the method for fee estimation will depend on the chosen backend and network. Must be set for neutrino on mainnet." hidden:"true"`
 
 	Bitcoin      *lncfg.Chain    `group:"Bitcoin" namespace:"bitcoin"`
 	BtcdMode     *lncfg.Btcd     `group:"btcd" namespace:"btcd"`
@@ -411,6 +422,8 @@ type Config struct {
 
 	RejectHTLC bool `long:"rejecthtlc" description:"If true, lnd will not forward any HTLCs that are meant as onward payments. This option will still allow lnd to send HTLCs and receive HTLCs but lnd won't be used as a hop."`
 
+	AcceptPositiveInboundFees bool `long:"accept-positive-inbound-fees" description:"If true, lnd will also allow setting positive inbound fees. By default, lnd only allows to set negative inbound fees (an inbound \"discount\") to remain backwards compatible with senders whose implementations do not yet support inbound fees."`
+
 	// RequireInterceptor determines whether the HTLC interceptor is
 	// registered regardless of whether the RPC is called or not.
 	RequireInterceptor bool `long:"requireinterceptor" description:"Whether to always intercept HTLCs, even if no stream is attached"`
@@ -439,7 +452,9 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	DustThreshold uint64 `long:"dust-threshold" description:"Sets the dust sum threshold in satoshis for a channel after which dust HTLC's will be failed."`
+	MaxFeeExposure uint64 `long:"dust-threshold" description:"Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed."`
+
+	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
 	Invoices *lncfg.Invoices `group:"invoices" namespace:"invoices"`
 
@@ -576,12 +591,17 @@ func DefaultConfig() Config {
 			UserAgentVersion: neutrino.UserAgentVersion,
 		},
 		BlockCacheSize:     defaultBlockCacheSize,
-		UnsafeDisconnect:   true,
 		MaxPendingChannels: lncfg.DefaultMaxPendingChannels,
 		NoSeedBackup:       defaultNoSeedBackup,
 		MinBackoff:         defaultMinBackoff,
 		MaxBackoff:         defaultMaxBackoff,
 		ConnectionTimeout:  tor.DefaultConnTimeout,
+
+		Fee: &lncfg.Fee{
+			MinUpdateTimeout: lncfg.DefaultMinUpdateTimeout,
+			MaxUpdateTimeout: lncfg.DefaultMaxUpdateTimeout,
+		},
+
 		SubRPCServers: &subRPCServerConfigs{
 			SignRPC:   &signrpc.Config{},
 			RouterRPC: routerrpc.DefaultConfig(),
@@ -663,6 +683,12 @@ func DefaultConfig() Config {
 				Attempts: defaultRSAttempts,
 				Backoff:  defaultRSBackoff,
 			},
+			LeaderCheck: &lncfg.CheckConfig{
+				Interval: defaultLeaderCheckInterval,
+				Timeout:  defaultLeaderCheckTimeout,
+				Attempts: defaultLeaderCheckAttempts,
+				Backoff:  defaultLeaderCheckBackoff,
+			},
 		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
@@ -672,10 +698,19 @@ func DefaultConfig() Config {
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
 		},
+		Routing: &lncfg.Routing{
+			BlindedPaths: lncfg.BlindedPaths{
+				MinNumRealHops:           lncfg.DefaultMinNumRealBlindedPathHops,
+				NumHops:                  lncfg.DefaultNumBlindedPathHops,
+				MaxNumPaths:              lncfg.DefaultMaxNumBlindedPaths,
+				PolicyIncreaseMultiplier: lncfg.DefaultBlindedPathPolicyIncreaseMultiplier,
+				PolicyDecreaseMultiplier: lncfg.DefaultBlindedPathPolicyDecreaseMultiplier,
+			},
+		},
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		DustThreshold:             uint64(htlcswitch.DefaultDustThreshold.ToSatoshis()),
+		MaxFeeExposure:            uint64(htlcswitch.DefaultMaxFeeExposure.ToSatoshis()),
 		LogWriter:                 build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
@@ -689,10 +724,7 @@ func DefaultConfig() Config {
 		RemoteSigner: &lncfg.RemoteSigner{
 			Timeout: lncfg.DefaultRemoteSignerRPCTimeout,
 		},
-		Sweeper: &lncfg.Sweeper{
-			BatchWindowDuration: sweep.DefaultBatchWindowDuration,
-			MaxFeeRate:          sweep.DefaultMaxFeeRate,
-		},
+		Sweeper: lncfg.DefaultSweeperConfig(),
 		Htlcswitch: &lncfg.Htlcswitch{
 			MailboxDeliveryTimeout: htlcswitch.DefaultMailboxDeliveryTimeout,
 		},
@@ -766,7 +798,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 		// If it's a parsing related error, then we'll return
 		// immediately, otherwise we can proceed as possibly the config
 		// file doesn't exist which is OK.
-		if _, ok := err.(*flags.IniError); ok {
+		if lnutils.ErrorAs[*flags.IniError](err) ||
+			lnutils.ErrorAs[*flags.Error](err) {
+
 			return nil, err
 		}
 
@@ -812,6 +846,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 	if configFileError != nil {
 		ltndLog.Warnf("%v", configFileError)
 	}
+
+	// Finally, log warnings for deprecated config options if they are set.
+	logWarningsForDeprecation(*cleanCfg)
 
 	return cleanCfg, nil
 }
@@ -1645,22 +1682,9 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
 
-	// Log a warning if our expiry delta is not greater than our incoming
-	// broadcast delta. We do not fail here because this value may be set
-	// to zero to intentionally keep lnd's behavior unchanged from when we
-	// didn't auto-cancel these invoices.
-	if cfg.Invoices.HoldExpiryDelta <= lncfg.DefaultIncomingBroadcastDelta {
-		ltndLog.Warnf("Invoice hold expiry delta: %v <= incoming "+
-			"delta: %v, accepted hold invoices will force close "+
-			"channels if they are not canceled manually",
-			cfg.Invoices.HoldExpiryDelta,
-			lncfg.DefaultIncomingBroadcastDelta)
-	}
-
 	// If the experimental protocol options specify any protocol messages
 	// that we want to handle as custom messages, set them now.
-	//nolint:lll
-	customMsg := cfg.ProtocolOptions.ExperimentalProtocol.CustomMessageOverrides()
+	customMsg := cfg.ProtocolOptions.CustomMessageOverrides()
 
 	// We can safely set our custom override values during startup because
 	// startup is blocked on config parsing.
@@ -1680,6 +1704,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.RemoteSigner,
 		cfg.Sweeper,
 		cfg.Htlcswitch,
+		cfg.Invoices,
+		cfg.Routing,
 	)
 	if err != nil {
 		return nil, err
@@ -1777,6 +1803,11 @@ func parseRPCParams(cConfig *lncfg.Chain, nodeConfig interface{},
 	var daemonName, confDir, confFile, confFileBase string
 	switch conf := nodeConfig.(type) {
 	case *lncfg.Btcd:
+		// Resolves environment variable references in RPCUser and
+		// RPCPass fields.
+		conf.RPCUser = supplyEnvValue(conf.RPCUser)
+		conf.RPCPass = supplyEnvValue(conf.RPCPass)
+
 		// If both RPCUser and RPCPass are set, we assume those
 		// credentials are good to use.
 		if conf.RPCUser != "" && conf.RPCPass != "" {
@@ -1822,6 +1853,11 @@ func parseRPCParams(cConfig *lncfg.Chain, nodeConfig interface{},
 		confFile = conf.ConfigPath
 		confFileBase = BitcoinChainName
 
+		// Resolves environment variable references in RPCUser
+		// and RPCPass fields.
+		conf.RPCUser = supplyEnvValue(conf.RPCUser)
+		conf.RPCPass = supplyEnvValue(conf.RPCPass)
+
 		// Check that cookie and credentials don't contradict each
 		// other.
 		if (conf.RPCUser != "" || conf.RPCPass != "") &&
@@ -1834,7 +1870,7 @@ func parseRPCParams(cConfig *lncfg.Chain, nodeConfig interface{},
 
 		// We convert the cookie into a user name and password.
 		if conf.RPCCookie != "" {
-			cookie, err := ioutil.ReadFile(conf.RPCCookie)
+			cookie, err := os.ReadFile(conf.RPCCookie)
 			if err != nil {
 				return fmt.Errorf("cannot read cookie file: %w",
 					err)
@@ -1917,6 +1953,70 @@ func parseRPCParams(cConfig *lncfg.Chain, nodeConfig interface{},
 	return nil
 }
 
+// supplyEnvValue supplies the value of an environment variable from a string.
+// It supports the following formats:
+// 1) $ENV_VAR
+// 2) ${ENV_VAR}
+// 3) ${ENV_VAR:-DEFAULT}
+//
+// Standard environment variable naming conventions:
+// - ENV_VAR contains letters, digits, and underscores, and does
+// not start with a digit.
+// - DEFAULT follows the rule that it can contain any characters except
+// whitespace.
+//
+// Parameters:
+// - value: The input string containing references to environment variables
+// (if any).
+//
+// Returns:
+// - string: The value of the specified environment variable, the default
+// value if provided, or the original input string if no matching variable is
+// found or set.
+func supplyEnvValue(value string) string {
+	// Regex for $ENV_VAR format.
+	var reEnvVar = regexp.MustCompile(`^\$([a-zA-Z_][a-zA-Z0-9_]*)$`)
+
+	// Regex for ${ENV_VAR} format.
+	var reEnvVarWithBrackets = regexp.MustCompile(
+		`^\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}$`,
+	)
+
+	// Regex for ${ENV_VAR:-DEFAULT} format.
+	var reEnvVarWithDefault = regexp.MustCompile(
+		`^\$\{([a-zA-Z_][a-zA-Z0-9_]*):-([\S]+)\}$`,
+	)
+
+	// Match against supported formats.
+	switch {
+	case reEnvVarWithDefault.MatchString(value):
+		matches := reEnvVarWithDefault.FindStringSubmatch(value)
+		envVariable := matches[1]
+		defaultValue := matches[2]
+		if envValue := os.Getenv(envVariable); envValue != "" {
+			return envValue
+		}
+
+		return defaultValue
+
+	case reEnvVarWithBrackets.MatchString(value):
+		matches := reEnvVarWithBrackets.FindStringSubmatch(value)
+		envVariable := matches[1]
+		envValue := os.Getenv(envVariable)
+
+		return envValue
+
+	case reEnvVar.MatchString(value):
+		matches := reEnvVar.FindStringSubmatch(value)
+		envVariable := matches[1]
+		envValue := os.Getenv(envVariable)
+
+		return envValue
+	}
+
+	return value
+}
+
 // extractBtcdRPCParams attempts to extract the RPC credentials for an existing
 // btcd instance. The passed path is expected to be the location of btcd's
 // application data directory on the target system.
@@ -1931,7 +2031,7 @@ func extractBtcdRPCParams(btcdConfigPath string) (string, string, error) {
 
 	// With the file open extract the contents of the configuration file so
 	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(btcdConfigFile)
+	configContents, err := io.ReadAll(btcdConfigFile)
 	if err != nil {
 		return "", "", err
 	}
@@ -1960,7 +2060,8 @@ func extractBtcdRPCParams(btcdConfigPath string) (string, string, error) {
 		return "", "", fmt.Errorf("unable to find rpcuser in config")
 	}
 
-	return string(userSubmatches[1]), string(passSubmatches[1]), nil
+	return supplyEnvValue(string(userSubmatches[1])),
+		supplyEnvValue(string(passSubmatches[1])), nil
 }
 
 // extractBitcoindRPCParams attempts to extract the RPC credentials for an
@@ -1980,7 +2081,7 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 
 	// With the file open extract the contents of the configuration file so
 	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(bitcoindConfigFile)
+	configContents, err := io.ReadAll(bitcoindConfigFile)
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -2042,7 +2143,7 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 	if rpcCookiePath != "" {
 		cookiePath = rpcCookiePath
 	}
-	cookie, err := ioutil.ReadFile(cookiePath)
+	cookie, err := os.ReadFile(cookiePath)
 	if err == nil {
 		splitCookie := strings.Split(string(cookie), ":")
 		if len(splitCookie) == 2 {
@@ -2085,7 +2186,8 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 			"in config")
 	}
 
-	return string(userSubmatches[1]), string(passSubmatches[1]),
+	return supplyEnvValue(string(userSubmatches[1])),
+		supplyEnvValue(string(passSubmatches[1])),
 		zmqBlockHost, zmqTxHost, nil
 }
 
@@ -2110,4 +2212,125 @@ func checkEstimateMode(estimateMode string) error {
 
 	return fmt.Errorf("estimatemode must be one of the following: %v",
 		bitcoindEstimateModes[:])
+}
+
+// configToFlatMap converts the given config struct into a flat map of
+// key/value pairs using the dot notation we are used to from the config file
+// or command line flags. It also returns a map containing deprecated config
+// options.
+func configToFlatMap(cfg Config) (map[string]string,
+	map[string]struct{}, error) {
+
+	result := make(map[string]string)
+
+	// deprecated stores a map of deprecated options found in the config
+	// that are set by the users. A config option is considered as
+	// deprecated if it has a `hidden` flag.
+	deprecated := make(map[string]struct{})
+
+	// redact is the helper function that redacts sensitive values like
+	// passwords.
+	redact := func(key, value string) string {
+		sensitiveKeySuffixes := []string{
+			"pass",
+			"password",
+			"dsn",
+		}
+		for _, suffix := range sensitiveKeySuffixes {
+			if strings.HasSuffix(key, suffix) {
+				return "[redacted]"
+			}
+		}
+
+		return value
+	}
+
+	// printConfig is the helper function that goes into nested structs
+	// recursively. Because we call it recursively, we need to declare it
+	// before we define it.
+	var printConfig func(reflect.Value, string)
+	printConfig = func(obj reflect.Value, prefix string) {
+		// Turn struct pointers into the actual struct, so we can
+		// iterate over the fields as we would with a struct value.
+		if obj.Kind() == reflect.Ptr {
+			obj = obj.Elem()
+		}
+
+		// Abort on nil values.
+		if !obj.IsValid() {
+			return
+		}
+
+		// Loop over all fields of the struct and inspect the type.
+		for i := 0; i < obj.NumField(); i++ {
+			field := obj.Field(i)
+			fieldType := obj.Type().Field(i)
+
+			longName := fieldType.Tag.Get("long")
+			namespace := fieldType.Tag.Get("namespace")
+			group := fieldType.Tag.Get("group")
+			hidden := fieldType.Tag.Get("hidden")
+
+			switch {
+			// We have a long name defined, this is a config value.
+			case longName != "":
+				key := longName
+				if prefix != "" {
+					key = prefix + "." + key
+				}
+
+				// Add the value directly to the flattened map.
+				result[key] = redact(key, fmt.Sprintf(
+					"%v", field.Interface(),
+				))
+
+				// If there's a hidden flag, it's deprecated.
+				if hidden == "true" && !field.IsZero() {
+					deprecated[key] = struct{}{}
+				}
+
+			// We have no long name but a namespace, this is a
+			// nested struct.
+			case longName == "" && namespace != "":
+				key := namespace
+				if prefix != "" {
+					key = prefix + "." + key
+				}
+
+				printConfig(field, key)
+
+			// Just a group means this is a dummy struct to house
+			// multiple config values, the group name doesn't go
+			// into the final field name.
+			case longName == "" && group != "":
+				printConfig(field, prefix)
+
+			// Anonymous means embedded struct. We need to recurse
+			// into it but without adding anything to the prefix.
+			case fieldType.Anonymous:
+				printConfig(field, prefix)
+
+			default:
+				continue
+			}
+		}
+	}
+
+	// Turn the whole config struct into a flat map.
+	printConfig(reflect.ValueOf(cfg), "")
+
+	return result, deprecated, nil
+}
+
+// logWarningsForDeprecation logs a warning if a deprecated config option is
+// set.
+func logWarningsForDeprecation(cfg Config) {
+	_, deprecated, err := configToFlatMap(cfg)
+	if err != nil {
+		ltndLog.Errorf("Convert configs to map: %v", err)
+	}
+
+	for k := range deprecated {
+		ltndLog.Warnf("Config '%s' is deprecated, please remove it", k)
+	}
 }

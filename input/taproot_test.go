@@ -48,7 +48,7 @@ func newTestSenderHtlcScriptTree(t *testing.T) *testSenderHtlcScriptTree {
 	payHash := preImage.Hash()
 	htlcScriptTree, err := SenderHTLCScriptTaproot(
 		senderKey.PubKey(), receiverKey.PubKey(), revokeKey.PubKey(),
-		payHash[:], false,
+		payHash[:], lntypes.Remote,
 	)
 	require.NoError(t, err)
 
@@ -287,7 +287,7 @@ func TestTaprootSenderHtlcSpend(t *testing.T) {
 
 		// Valid spend with the revocation key, sighash all.
 		{
-			name: "revocation spend vaild sighash all",
+			name: "revocation spend valid sighash all",
 			witnessGen: htlcSenderRevocationWitnessGen(
 				txscript.SigHashAll, htlcScriptTree,
 			),
@@ -296,7 +296,7 @@ func TestTaprootSenderHtlcSpend(t *testing.T) {
 
 		// Valid spend with the revocation key, sighash default.
 		{
-			name: "revocation spend vaild sighash default",
+			name: "revocation spend valid sighash default",
 			witnessGen: htlcSenderRevocationWitnessGen(
 				txscript.SigHashDefault, htlcScriptTree,
 			),
@@ -306,7 +306,7 @@ func TestTaprootSenderHtlcSpend(t *testing.T) {
 		// Valid spend with the revocation key, sighash single+anyone
 		// can pay.
 		{
-			name: "revocation spend vaild sighash " +
+			name: "revocation spend valid sighash " +
 				"single|anyonecanpay",
 			witnessGen: htlcSenderRevocationWitnessGen(
 				txscript.SigHashSingle|
@@ -471,7 +471,7 @@ func newTestReceiverHtlcScriptTree(t *testing.T) *testReceiverHtlcScriptTree {
 	payHash := preImage.Hash()
 	htlcScriptTree, err := ReceiverHTLCScriptTaproot(
 		cltvExpiry, senderKey.PubKey(), receiverKey.PubKey(),
-		revokeKey.PubKey(), payHash[:], false,
+		revokeKey.PubKey(), payHash[:], lntypes.Remote,
 	)
 	require.NoError(t, err)
 

@@ -3,9 +3,9 @@ package lnd
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -31,6 +32,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -42,6 +44,7 @@ import (
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/rpcperms"
 	"github.com/lightningnetwork/lnd/signal"
+	"github.com/lightningnetwork/lnd/sqldb"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/lightningnetwork/lnd/watchtower"
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
@@ -325,7 +328,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	case d.cfg.WalletUnlockPasswordFile != "" && walletExists:
 		d.logger.Infof("Attempting automatic wallet unlock with " +
 			"password provided in file")
-		pwBytes, err := ioutil.ReadFile(d.cfg.WalletUnlockPasswordFile)
+		pwBytes, err := os.ReadFile(d.cfg.WalletUnlockPasswordFile)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("error reading "+
 				"password from file %s: %v",
@@ -425,7 +428,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		// wallet unlocker.
 		err = macaroonService.CreateUnlock(&privateWalletPw)
 		if err != nil && err != macaroons.ErrAlreadyUnlocked {
-			err := fmt.Errorf("unable to unlock macaroons: %v", err)
+			err := fmt.Errorf("unable to unlock macaroons: %w", err)
 			d.logger.Error(err)
 			return nil, nil, nil, err
 		}
@@ -547,6 +550,11 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		NeutrinoCS:                  neutrinoCS,
 		ActiveNetParams:             d.cfg.ActiveNetParams,
 		FeeURL:                      d.cfg.FeeURL,
+		Fee: &lncfg.Fee{
+			URL:              d.cfg.Fee.URL,
+			MinUpdateTimeout: d.cfg.Fee.MinUpdateTimeout,
+			MaxUpdateTimeout: d.cfg.Fee.MaxUpdateTimeout,
+		},
 		Dialer: func(addr string) (net.Conn, error) {
 			return d.cfg.net.Dial(
 				"tcp", addr, d.cfg.ConnectionTimeout,
@@ -564,7 +572,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	)
 	cleanUpTasks = append(cleanUpTasks, pccCleanup)
 	if err != nil {
-		err := fmt.Errorf("unable to create partial chain control: %v",
+		err := fmt.Errorf("unable to create partial chain control: %w",
 			err)
 		d.logger.Error(err)
 		return nil, nil, nil, err
@@ -674,7 +682,7 @@ func (d *DefaultWalletImpl) BuildChainControl(
 		*walletConfig, partialChainControl.Cfg.BlockCache,
 	)
 	if err != nil {
-		err := fmt.Errorf("unable to create wallet controller: %v", err)
+		err := fmt.Errorf("unable to create wallet controller: %w", err)
 		d.logger.Error(err)
 		return nil, nil, err
 	}
@@ -686,23 +694,23 @@ func (d *DefaultWalletImpl) BuildChainControl(
 	// Create, and start the lnwallet, which handles the core payment
 	// channel logic, and exposes control via proxy state machines.
 	lnWalletConfig := lnwallet.Config{
-		Database:           partialChainControl.Cfg.ChanStateDB,
-		Notifier:           partialChainControl.ChainNotifier,
-		WalletController:   walletController,
-		Signer:             walletController,
-		FeeEstimator:       partialChainControl.FeeEstimator,
-		SecretKeyRing:      keyRing,
-		ChainIO:            walletController,
-		DefaultConstraints: partialChainControl.ChannelConstraints,
-		NetParams:          *walletConfig.NetParams,
+		Database:              partialChainControl.Cfg.ChanStateDB,
+		Notifier:              partialChainControl.ChainNotifier,
+		WalletController:      walletController,
+		Signer:                walletController,
+		FeeEstimator:          partialChainControl.FeeEstimator,
+		SecretKeyRing:         keyRing,
+		ChainIO:               walletController,
+		NetParams:             *walletConfig.NetParams,
+		CoinSelectionStrategy: walletConfig.CoinSelectionStrategy,
 	}
 
 	// The broadcast is already always active for neutrino nodes, so we
 	// don't want to create a rebroadcast loop.
 	if partialChainControl.Cfg.NeutrinoCS == nil {
+		cs := partialChainControl.ChainSource
 		broadcastCfg := pushtx.Config{
 			Broadcast: func(tx *wire.MsgTx) error {
-				cs := partialChainControl.ChainSource
 				_, err := cs.SendRawTransaction(
 					tx, true,
 				)
@@ -716,7 +724,10 @@ func (d *DefaultWalletImpl) BuildChainControl(
 			// In case the backend is different from neutrino we
 			// make sure that broadcast backend errors are mapped
 			// to the neutrino broadcastErr.
-			MapCustomBroadcastError: broadcastErrorMapper,
+			MapCustomBroadcastError: func(err error) error {
+				rpcErr := cs.MapRPCErr(err)
+				return broadcastErrorMapper(rpcErr)
+			},
 		}
 
 		lnWalletConfig.Rebroadcaster = newWalletReBroadcaster(
@@ -730,7 +741,7 @@ func (d *DefaultWalletImpl) BuildChainControl(
 		lnWalletConfig, walletController, partialChainControl,
 	)
 	if err != nil {
-		err := fmt.Errorf("unable to create chain control: %v", err)
+		err := fmt.Errorf("unable to create chain control: %w", err)
 		d.logger.Error(err)
 		return nil, nil, err
 	}
@@ -778,7 +789,7 @@ func (d *RPCSignerWalletImpl) BuildChainControl(
 		*walletConfig, partialChainControl.Cfg.BlockCache,
 	)
 	if err != nil {
-		err := fmt.Errorf("unable to create wallet controller: %v", err)
+		err := fmt.Errorf("unable to create wallet controller: %w", err)
 		d.logger.Error(err)
 		return nil, nil, err
 	}
@@ -801,15 +812,15 @@ func (d *RPCSignerWalletImpl) BuildChainControl(
 	// Create, and start the lnwallet, which handles the core payment
 	// channel logic, and exposes control via proxy state machines.
 	lnWalletConfig := lnwallet.Config{
-		Database:           partialChainControl.Cfg.ChanStateDB,
-		Notifier:           partialChainControl.ChainNotifier,
-		WalletController:   rpcKeyRing,
-		Signer:             rpcKeyRing,
-		FeeEstimator:       partialChainControl.FeeEstimator,
-		SecretKeyRing:      rpcKeyRing,
-		ChainIO:            walletController,
-		DefaultConstraints: partialChainControl.ChannelConstraints,
-		NetParams:          *walletConfig.NetParams,
+		Database:              partialChainControl.Cfg.ChanStateDB,
+		Notifier:              partialChainControl.ChainNotifier,
+		WalletController:      rpcKeyRing,
+		Signer:                rpcKeyRing,
+		FeeEstimator:          partialChainControl.FeeEstimator,
+		SecretKeyRing:         rpcKeyRing,
+		ChainIO:               walletController,
+		NetParams:             *walletConfig.NetParams,
+		CoinSelectionStrategy: walletConfig.CoinSelectionStrategy,
 	}
 
 	// We've created the wallet configuration now, so we can finish
@@ -818,7 +829,7 @@ func (d *RPCSignerWalletImpl) BuildChainControl(
 		lnWalletConfig, rpcKeyRing, partialChainControl,
 	)
 	if err != nil {
-		err := fmt.Errorf("unable to create chain control: %v", err)
+		err := fmt.Errorf("unable to create chain control: %w", err)
 		d.logger.Error(err)
 		return nil, nil, err
 	}
@@ -869,6 +880,11 @@ type DatabaseInstances struct {
 	// WalletDB is the configuration for loading the wallet database using
 	// the btcwallet's loader.
 	WalletDB btcwallet.LoaderOption
+
+	// NativeSQLStore is a pointer to a native SQL store that can be used
+	// for native SQL queries for tables that already support it. This may
+	// be nil if the use-native-sql flag was not set.
+	NativeSQLStore *sqldb.BaseDB
 }
 
 // DefaultDatabaseBuilder is a type that builds the default database backends
@@ -923,10 +939,11 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 	// state DB point to the same local or remote DB and the same namespace
 	// within that DB.
 	dbs := &DatabaseInstances{
-		HeightHintDB: databaseBackends.HeightHintDB,
-		MacaroonDB:   databaseBackends.MacaroonDB,
-		DecayedLogDB: databaseBackends.DecayedLogDB,
-		WalletDB:     databaseBackends.WalletDB,
+		HeightHintDB:   databaseBackends.HeightHintDB,
+		MacaroonDB:     databaseBackends.MacaroonDB,
+		DecayedLogDB:   databaseBackends.DecayedLogDB,
+		WalletDB:       databaseBackends.WalletDB,
+		NativeSQLStore: databaseBackends.NativeSQLStore,
 	}
 	cleanUp := func() {
 		// We can just close the returned close functions directly. Even
@@ -993,7 +1010,7 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 	case err != nil:
 		cleanUp()
 
-		err := fmt.Errorf("unable to open graph DB: %v", err)
+		err := fmt.Errorf("unable to open graph DB: %w", err)
 		d.logger.Error(err)
 		return nil, nil, err
 	}
@@ -1011,11 +1028,49 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 	// using the same struct (and DB backend) instance.
 	dbs.ChanStateDB = dbs.GraphDB
 
-	// For now the only InvoiceDB implementation is the *channeldb.DB.
-	//
-	// TODO(positiveblue): use a sql first implementation for this
-	// interface.
-	dbs.InvoiceDB = dbs.GraphDB
+	// Instantiate a native SQL invoice store if the flag is set.
+	if d.cfg.DB.UseNativeSQL {
+		// KV invoice db resides in the same database as the graph and
+		// channel state DB. Let's query the database to see if we have
+		// any invoices there. If we do, we won't allow the user to
+		// start lnd with native SQL enabled, as we don't currently
+		// migrate the invoices to the new database schema.
+		invoiceSlice, err := dbs.GraphDB.QueryInvoices(
+			ctx, invoices.InvoiceQuery{
+				NumMaxInvoices: 1,
+			},
+		)
+		if err != nil {
+			cleanUp()
+			d.logger.Errorf("Unable to query KV invoice DB: %v",
+				err)
+
+			return nil, nil, err
+		}
+
+		if len(invoiceSlice.Invoices) > 0 {
+			cleanUp()
+			err := fmt.Errorf("found invoices in the KV invoice " +
+				"DB, migration to native SQL is not yet " +
+				"supported")
+			d.logger.Error(err)
+
+			return nil, nil, err
+		}
+
+		executor := sqldb.NewTransactionExecutor(
+			dbs.NativeSQLStore,
+			func(tx *sql.Tx) invoices.SQLInvoiceQueries {
+				return dbs.NativeSQLStore.WithTx(tx)
+			},
+		)
+
+		dbs.InvoiceDB = invoices.NewSQLStore(
+			executor, clock.NewDefaultClock(),
+		)
+	} else {
+		dbs.InvoiceDB = dbs.GraphDB
+	}
 
 	// Wrap the watchtower client DB and make sure we clean up.
 	if cfg.WtClient.Active {
@@ -1025,7 +1080,7 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 		if err != nil {
 			cleanUp()
 
-			err := fmt.Errorf("unable to open %s database: %v",
+			err := fmt.Errorf("unable to open %s database: %w",
 				lncfg.NSTowerClientDB, err)
 			d.logger.Error(err)
 			return nil, nil, err
@@ -1040,7 +1095,7 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 		if err != nil {
 			cleanUp()
 
-			err := fmt.Errorf("unable to open %s database: %v",
+			err := fmt.Errorf("unable to open %s database: %w",
 				lncfg.NSTowerServerDB, err)
 			d.logger.Error(err)
 			return nil, nil, err
@@ -1255,7 +1310,7 @@ func importWatchOnlyAccounts(wallet *wallet.Wallet,
 			addrSchema,
 		)
 		if err != nil {
-			return fmt.Errorf("could not import account %v: %v",
+			return fmt.Errorf("could not import account %v: %w",
 				name, err)
 		}
 	}
@@ -1298,8 +1353,9 @@ func initNeutrinoBackend(ctx context.Context, cfg *Config, chainDir string,
 	)
 	switch {
 	case cfg.DB.Backend == kvdb.SqliteBackendName:
+		sqliteConfig := lncfg.GetSqliteConfigKVDB(cfg.DB.Sqlite)
 		db, err = kvdb.Open(
-			kvdb.SqliteBackendName, ctx, cfg.DB.Sqlite, dbPath,
+			kvdb.SqliteBackendName, ctx, sqliteConfig, dbPath,
 			lncfg.SqliteNeutrinoDBName, lncfg.NSNeutrinoDB,
 		)
 
@@ -1404,12 +1460,12 @@ func parseHeaderStateAssertion(state string) (*headerfs.FilterHeader, error) {
 
 	height, err := strconv.ParseUint(split[0], 10, 32)
 	if err != nil {
-		return nil, fmt.Errorf("invalid filter header height: %v", err)
+		return nil, fmt.Errorf("invalid filter header height: %w", err)
 	}
 
 	hash, err := chainhash.NewHashFromStr(split[1])
 	if err != nil {
-		return nil, fmt.Errorf("invalid filter header hash: %v", err)
+		return nil, fmt.Errorf("invalid filter header hash: %w", err)
 	}
 
 	return &headerfs.FilterHeader{
@@ -1422,29 +1478,27 @@ func parseHeaderStateAssertion(state string) (*headerfs.FilterHeader, error) {
 // the neutrino BroadcastError which allows the Rebroadcaster which currently
 // resides in the neutrino package to use all of its functionalities.
 func broadcastErrorMapper(err error) error {
-	returnErr := wallet.MapBroadcastBackendError(err)
+	var returnErr error
 
 	// We only filter for specific backend errors which are relevant for the
 	// Rebroadcaster.
-	var errAlreadyConfirmed *wallet.ErrAlreadyConfirmed
-	var errInMempool *wallet.ErrInMempool
-	var errMempoolFee *wallet.ErrMempoolFee
-
 	switch {
 	// This makes sure the tx is removed from the rebroadcaster once it is
 	// confirmed.
-	case errors.As(returnErr, &errAlreadyConfirmed):
+	case errors.Is(err, chain.ErrTxAlreadyKnown),
+		errors.Is(err, chain.ErrTxAlreadyConfirmed):
+
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Confirmed,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 
 	// Transactions which are still in mempool but might fall out because
 	// of low fees are rebroadcasted despite of their backend error.
-	case errors.As(returnErr, &errInMempool):
+	case errors.Is(err, chain.ErrTxAlreadyInMempool):
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Mempool,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 
 	// Transactions which are not accepted into mempool because of low fees
@@ -1452,13 +1506,12 @@ func broadcastErrorMapper(err error) error {
 	// Mempool conditions change over time so it makes sense to retry
 	// publishing the transaction. Moreover we log the detailed error so the
 	// user can intervene and increase the size of his mempool.
-	case errors.As(returnErr, &errMempoolFee):
-		ltndLog.Warnf("Error while broadcasting transaction: %v",
-			returnErr)
+	case errors.Is(err, chain.ErrMempoolMinFeeNotMet):
+		ltndLog.Warnf("Error while broadcasting transaction: %v", err)
 
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Mempool,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 	}
 

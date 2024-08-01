@@ -1,3 +1,5 @@
+//go:build !js && !(windows && (arm || 386)) && !(linux && (ppc64 || mips || mipsle || mips64))
+
 package sqldb
 
 import (
@@ -6,7 +8,6 @@ import (
 	"net/url"
 	"path/filepath"
 	"testing"
-	"time"
 
 	sqlite_migrate "github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/lightningnetwork/lnd/sqldb/sqlc"
@@ -23,31 +24,17 @@ const (
 	// sqliteTxLockImmediate is a dsn option used to ensure that write
 	// transactions are started immediately.
 	sqliteTxLockImmediate = "_txlock=immediate"
-
-	// defaultMaxConns is the number of permitted active and idle
-	// connections. We want to limit this so it isn't unlimited. We use the
-	// same value for the number of idle connections as, this can speed up
-	// queries given a new connection doesn't need to be established each
-	// time.
-	defaultMaxConns = 25
-
-	// connIdleLifetime is the amount of time a connection can be idle.
-	connIdleLifetime = 5 * time.Minute
 )
 
-// SqliteConfig holds all the config arguments needed to interact with our
-// sqlite DB.
-//
-//nolint:lll
-type SqliteConfig struct {
-	// SkipMigrations if true, then all the tables will be created on start
-	// up if they don't already exist.
-	SkipMigrations bool `long:"skipmigrations" description:"Skip applying migrations on startup."`
-
-	// DatabaseFileName is the full file path where the database file can be
-	// found.
-	DatabaseFileName string `long:"dbfile" description:"The full path to the database."`
-}
+var (
+	// sqliteSchemaReplacements is a map of schema strings that need to be
+	// replaced for sqlite. This is needed because sqlite doesn't directly
+	// support the BIGINT type for primary keys, so we need to replace it
+	// with INTEGER.
+	sqliteSchemaReplacements = map[string]string{
+		"BIGINT PRIMARY KEY": "INTEGER PRIMARY KEY",
+	}
+)
 
 // SqliteStore is a database store implementation that uses a sqlite backend.
 type SqliteStore struct {
@@ -58,7 +45,7 @@ type SqliteStore struct {
 
 // NewSqliteStore attempts to open a new sqlite database based on the passed
 // config.
-func NewSqliteStore(cfg *SqliteConfig) (*SqliteStore, error) {
+func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 	// The set of pragma options are accepted using query options. For now
 	// we only want to ensure that foreign key constraints are properly
 	// enforced.
@@ -107,7 +94,7 @@ func NewSqliteStore(cfg *SqliteConfig) (*SqliteStore, error) {
 	// details on the formatting here, see the modernc.org/sqlite docs:
 	// https://pkg.go.dev/modernc.org/sqlite#Driver.Open.
 	dsn := fmt.Sprintf(
-		"%v?%v&%v", cfg.DatabaseFileName, sqliteOptions.Encode(),
+		"%v?%v&%v", dbPath, sqliteOptions.Encode(),
 		sqliteTxLockImmediate,
 	)
 	db, err := sql.Open("sqlite", dsn)
@@ -118,38 +105,44 @@ func NewSqliteStore(cfg *SqliteConfig) (*SqliteStore, error) {
 	db.SetMaxOpenConns(defaultMaxConns)
 	db.SetMaxIdleConns(defaultMaxConns)
 	db.SetConnMaxLifetime(connIdleLifetime)
-
-	if !cfg.SkipMigrations {
-		// Now that the database is open, populate the database with
-		// our set of schemas based on our embedded in-memory file
-		// system.
-		//
-		// First, we'll need to open up a new migration instance for
-		// our current target database: sqlite.
-		driver, err := sqlite_migrate.WithInstance(
-			db, &sqlite_migrate.Config{},
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		err = applyMigrations(
-			sqlSchemas, driver, "sqlc/migrations", "sqlc",
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	queries := sqlc.New(db)
 
-	return &SqliteStore{
+	s := &SqliteStore{
 		cfg: cfg,
 		BaseDB: &BaseDB{
 			DB:      db,
 			Queries: queries,
 		},
-	}, nil
+	}
+
+	// Execute migrations unless configured to skip them.
+	if !cfg.SkipMigrations {
+		if err := s.ExecuteMigrations(TargetLatest); err != nil {
+			return nil, fmt.Errorf("error executing migrations: "+
+				"%w", err)
+
+		}
+	}
+
+	return s, nil
+}
+
+// ExecuteMigrations runs migrations for the sqlite database, depending on the
+// target given, either all migrations or up to a given version.
+func (s *SqliteStore) ExecuteMigrations(target MigrationTarget) error {
+	driver, err := sqlite_migrate.WithInstance(
+		s.DB, &sqlite_migrate.Config{},
+	)
+	if err != nil {
+		return fmt.Errorf("error creating sqlite migration: %w", err)
+	}
+
+	// Populate the database with our set of schemas based on our embedded
+	// in-memory file system.
+	sqliteFS := newReplacerFS(sqlSchemas, sqliteSchemaReplacements)
+	return applyMigrations(
+		sqliteFS, driver, "sqlc/migrations", "sqlite", target,
+	)
 }
 
 // NewTestSqliteDB is a helper function that creates an SQLite database for
@@ -163,9 +156,34 @@ func NewTestSqliteDB(t *testing.T) *SqliteStore {
 	// an in mem version to speed up tests
 	dbFileName := filepath.Join(t.TempDir(), "tmp.db")
 	sqlDB, err := NewSqliteStore(&SqliteConfig{
-		DatabaseFileName: dbFileName,
-		SkipMigrations:   false,
+		SkipMigrations: false,
+	}, dbFileName)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, sqlDB.DB.Close())
 	})
+
+	return sqlDB
+}
+
+// NewTestSqliteDBWithVersion is a helper function that creates an SQLite
+// database for testing and migrates it to the given version.
+func NewTestSqliteDBWithVersion(t *testing.T, version uint) *SqliteStore {
+	t.Helper()
+
+	t.Logf("Creating new SQLite DB for testing, migrating to version %d",
+		version)
+
+	// TODO(roasbeef): if we pass :memory: for the file name, then we get
+	// an in mem version to speed up tests
+	dbFileName := filepath.Join(t.TempDir(), "tmp.db")
+	sqlDB, err := NewSqliteStore(&SqliteConfig{
+		SkipMigrations: true,
+	}, dbFileName)
+	require.NoError(t, err)
+
+	err = sqlDB.ExecuteMigrations(TargetVersion(version))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {

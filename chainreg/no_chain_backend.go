@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -211,6 +212,16 @@ func (n *NoChainSource) Notifications() <-chan interface{} {
 
 func (n *NoChainSource) BackEnd() string {
 	return noChainBackendName
+}
+
+func (n *NoChainSource) TestMempoolAccept([]*wire.MsgTx,
+	float64) ([]*btcjson.TestMempoolAcceptResult, error) {
+
+	return nil, nil
+}
+
+func (n *NoChainSource) MapRPCErr(err error) error {
+	return err
 }
 
 var _ chain.Interface = (*NoChainSource)(nil)

@@ -3,6 +3,7 @@ package contractcourt
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,13 +12,18 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 const (
@@ -175,7 +181,7 @@ type chainWatcherConfig struct {
 
 	// contractBreach is a method that will be called by the watcher if it
 	// detects that a contract breach transaction has been confirmed. It
-	// will only return a non-nil error when the breachArbiter has
+	// will only return a non-nil error when the BreachArbitrator has
 	// preserved the necessary breach info for this channel point.
 	contractBreach func(*lnwallet.BreachRetribution) error
 
@@ -413,7 +419,7 @@ func (c *chainWatcher) handleUnknownLocalState(
 	// and remote keys for this state. We use our point as only we can
 	// revoke our own commitment.
 	commitKeyRing := lnwallet.DeriveCommitmentKeys(
-		commitPoint, true, c.cfg.chanState.ChanType,
+		commitPoint, lntypes.Local, c.cfg.chanState.ChanType,
 		&c.cfg.chanState.LocalChanCfg, &c.cfg.chanState.RemoteChanCfg,
 	)
 
@@ -686,7 +692,10 @@ func (c *chainWatcher) closeObserver(spendNtfn *chainntnfs.SpendEvent) {
 		// sequence number that's finalized. This won't happen with
 		// regular commitment transactions due to the state hint
 		// encoding scheme.
-		if commitTxBroadcast.TxIn[0].Sequence == wire.MaxTxInSequenceNum {
+		switch commitTxBroadcast.TxIn[0].Sequence {
+		case wire.MaxTxInSequenceNum:
+			fallthrough
+		case mempool.MaxRBFSequence:
 			// TODO(roasbeef): rare but possible, need itest case
 			// for
 			err := c.dispatchCooperativeClose(commitSpend)
@@ -883,7 +892,7 @@ func (c *chainWatcher) handlePossibleBreach(commitSpend *chainntnfs.SpendDetail,
 	// Create an AnchorResolution for the breached state.
 	anchorRes, err := lnwallet.NewAnchorResolution(
 		c.cfg.chanState, commitSpend.SpendingTx, retribution.KeyRing,
-		false,
+		lntypes.Remote,
 	)
 	if err != nil {
 		return false, fmt.Errorf("unable to create anchor "+
@@ -970,28 +979,67 @@ func (c *chainWatcher) handleUnknownRemoteState(
 }
 
 // toSelfAmount takes a transaction and returns the sum of all outputs that pay
-// to a script that the wallet controls. If no outputs pay to us, then we
+// to a script that the wallet controls or the channel defines as its delivery
+// script . If no outputs pay to us (determined by these criteria), then we
 // return zero. This is possible as our output may have been trimmed due to
 // being dust.
 func (c *chainWatcher) toSelfAmount(tx *wire.MsgTx) btcutil.Amount {
-	var selfAmt btcutil.Amount
-	for _, txOut := range tx.TxOut {
-		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-			// Doesn't matter what net we actually pass in.
-			txOut.PkScript, &chaincfg.TestNet3Params,
-		)
-		if err != nil {
-			continue
-		}
+	// There are two main cases we have to handle here. First, in the coop
+	// close case we will always have saved the delivery address we used
+	// whether it was from the upfront shutdown, from the delivery address
+	// requested at close time, or even an automatically generated one. All
+	// coop-close cases can be identified in the following manner:
+	shutdown, _ := c.cfg.chanState.ShutdownInfo()
+	oDeliveryAddr := fn.MapOption(
+		func(i channeldb.ShutdownInfo) lnwire.DeliveryAddress {
+			return i.DeliveryScript.Val
+		})(shutdown)
 
-		for _, addr := range addrs {
-			if c.cfg.isOurAddr(addr) {
-				selfAmt += btcutil.Amount(txOut.Value)
-			}
-		}
+	// Here we define a function capable of identifying whether an output
+	// corresponds with our local delivery script from a ShutdownInfo if we
+	// have a ShutdownInfo for this chainWatcher's underlying channel.
+	//
+	// isDeliveryOutput :: *TxOut -> bool
+	isDeliveryOutput := func(o *wire.TxOut) bool {
+		return fn.ElimOption(
+			oDeliveryAddr,
+			// If we don't have a delivery addr, then the output
+			// can't match it.
+			func() bool { return false },
+			// Otherwise if the PkScript of the TxOut matches our
+			// delivery script then this is a delivery output.
+			func(a lnwire.DeliveryAddress) bool {
+				return slices.Equal(a, o.PkScript)
+			},
+		)
 	}
 
-	return selfAmt
+	// Here we define a function capable of identifying whether an output
+	// belongs to the LND wallet. We use this as a heuristic in the case
+	// where we might be looking for spendable force closure outputs.
+	//
+	// isWalletOutput :: *TxOut -> bool
+	isWalletOutput := func(out *wire.TxOut) bool {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			// Doesn't matter what net we actually pass in.
+			out.PkScript, &chaincfg.TestNet3Params,
+		)
+		if err != nil {
+			return false
+		}
+
+		return fn.Any(c.cfg.isOurAddr, addrs)
+	}
+
+	// Grab all of the outputs that correspond with our delivery address
+	// or our wallet is aware of.
+	outs := fn.Filter(fn.PredOr(isDeliveryOutput, isWalletOutput), tx.TxOut)
+
+	// Grab the values for those outputs.
+	vals := fn.Map(func(o *wire.TxOut) int64 { return o.Value }, outs)
+
+	// Return the sum.
+	return btcutil.Amount(fn.Sum(vals))
 }
 
 // dispatchCooperativeClose processed a detect cooperative channel closure.
@@ -1202,13 +1250,13 @@ func (c *chainWatcher) dispatchContractBreach(spendEvent *chainntnfs.SpendDetail
 		c.cfg.chanState.FundingOutpoint, broadcastStateNum)
 
 	if err := c.cfg.chanState.MarkBorked(); err != nil {
-		return fmt.Errorf("unable to mark channel as borked: %v", err)
+		return fmt.Errorf("unable to mark channel as borked: %w", err)
 	}
 
 	spendHeight := uint32(spendEvent.SpendingHeight)
 
 	log.Debugf("Punishment breach retribution created: %v",
-		newLogClosure(func() string {
+		lnutils.NewLogClosure(func() string {
 			retribution.KeyRing.LocalHtlcKey = nil
 			retribution.KeyRing.RemoteHtlcKey = nil
 			retribution.KeyRing.ToLocalKey = nil
@@ -1243,14 +1291,14 @@ func (c *chainWatcher) dispatchContractBreach(spendEvent *chainntnfs.SpendDetail
 		closeSummary.LastChanSyncMsg = chanSync
 	}
 
-	// Hand the retribution info over to the breach arbiter. This function
+	// Hand the retribution info over to the BreachArbitrator. This function
 	// will wait for a response from the breach arbiter and then proceed to
 	// send a BreachCloseInfo to the channel arbitrator. The channel arb
 	// will then mark the channel as closed after resolutions and the
 	// commit set are logged in the arbitrator log.
 	if err := c.cfg.contractBreach(retribution); err != nil {
 		log.Errorf("unable to hand breached contract off to "+
-			"breachArbiter: %v", err)
+			"BreachArbitrator: %v", err)
 		return err
 	}
 

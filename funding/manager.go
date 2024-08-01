@@ -23,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/discovery"
+	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/labels"
@@ -33,7 +34,6 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing"
 	"golang.org/x/crypto/salsa20"
 )
 
@@ -48,6 +48,14 @@ var (
 	//
 	// NOTE: for itest, this value is changed to 10ms.
 	checkPeerChannelReadyInterval = 1 * time.Second
+
+	// errNoLocalNonce is returned when a local nonce is not found in the
+	// expected TLV.
+	errNoLocalNonce = fmt.Errorf("local nonce not found")
+
+	// errNoPartialSig is returned when a partial sig is not found in the
+	// expected TLV.
+	errNoPartialSig = fmt.Errorf("partial sig not found")
 )
 
 // WriteOutpoint writes an outpoint to an io.Writer. This is not the same as
@@ -529,6 +537,12 @@ type Config struct {
 	// AliasManager is an implementation of the aliasHandler interface that
 	// abstracts away the handling of many alias functions.
 	AliasManager aliasHandler
+
+	// IsSweeperOutpoint queries the sweeper store for successfully
+	// published sweeps. This is useful to decide for the internal wallet
+	// backed funding flow to not use utxos still being swept by the sweeper
+	// subsystem.
+	IsSweeperOutpoint func(wire.OutPoint) bool
 }
 
 // Manager acts as an orchestrator/bridge between the wallet's
@@ -615,11 +629,11 @@ const (
 	// but we still haven't announced the channel to the network.
 	channelReadySent
 
-	// addedToRouterGraph is the opening state of a channel if the
-	// channel has been successfully added to the router graph
-	// immediately after the channelReady message has been sent, but
-	// we still haven't announced the channel to the network.
-	addedToRouterGraph
+	// addedToGraph is the opening state of a channel if the channel has
+	// been successfully added to the graph immediately after the
+	// channelReady message has been sent, but we still haven't announced
+	// the channel to the network.
+	addedToGraph
 )
 
 func (c channelOpeningState) String() string {
@@ -628,8 +642,8 @@ func (c channelOpeningState) String() string {
 		return "markedOpen"
 	case channelReadySent:
 		return "channelReadySent"
-	case addedToRouterGraph:
-		return "addedToRouterGraph"
+	case addedToGraph:
+		return "addedToGraph"
 	default:
 		return "unknown"
 	}
@@ -690,7 +704,7 @@ func (f *Manager) start() error {
 	}
 
 	for _, channel := range allChannels {
-		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 
 		// For any channels that were in a pending state when the
 		// daemon was last connected, the Funding Manager will
@@ -904,7 +918,8 @@ func (f *Manager) failFundingFlow(peer lnpeer.Peer, cid *chanIdentifier,
 		err := peer.RemovePendingChannel(cid.chanID)
 		if err != nil {
 			log.Errorf("Unable to remove channel %v with peer %x: "+
-				"%v", cid, peer.IdentityKey(), err)
+				"%v", cid,
+				peer.IdentityKey().SerializeCompressed(), err)
 		}
 	}
 
@@ -946,6 +961,28 @@ func (f *Manager) failFundingFlow(peer lnpeer.Peer, cid *chanIdentifier,
 
 	log.Debugf("Sending funding error to peer (%x): %v",
 		peer.IdentityKey().SerializeCompressed(), spew.Sdump(errMsg))
+	if err := peer.SendMessage(false, errMsg); err != nil {
+		log.Errorf("unable to send error message to peer %v", err)
+	}
+}
+
+// sendWarning sends a new warning message to the target peer, targeting the
+// specified cid with the passed funding error.
+func (f *Manager) sendWarning(peer lnpeer.Peer, cid *chanIdentifier,
+	fundingErr error) {
+
+	msg := fundingErr.Error()
+
+	errMsg := &lnwire.Warning{
+		ChanID: cid.tempChanID,
+		Data:   lnwire.WarningData(msg),
+	}
+
+	log.Debugf("Sending funding warning to peer (%x): %v",
+		peer.IdentityKey().SerializeCompressed(),
+		spew.Sdump(errMsg),
+	)
+
 	if err := peer.SendMessage(false, errMsg); err != nil {
 		log.Errorf("unable to send error message to peer %v", err)
 	}
@@ -1002,9 +1039,9 @@ func (f *Manager) reservationCoordinator() {
 // advanceFundingState will advance the channel through the steps after the
 // funding transaction is broadcasted, up until the point where the channel is
 // ready for operation. This includes waiting for the funding transaction to
-// confirm, sending channel_ready to the peer, adding the channel to the
-// router graph, and announcing the channel. The updateChan can be set non-nil
-// to get OpenStatusUpdates.
+// confirm, sending channel_ready to the peer, adding the channel to the graph,
+// and announcing the channel. The updateChan can be set non-nil to get
+// OpenStatusUpdates.
 //
 // NOTE: This MUST be run as a goroutine.
 func (f *Manager) advanceFundingState(channel *channeldb.OpenChannel,
@@ -1082,7 +1119,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 	channelState channelOpeningState,
 	updateChan chan<- *lnrpc.OpenStatusUpdate) error {
 
-	chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 	log.Debugf("Channel(%v) with ShortChanID %v has opening state %v",
 		chanID, shortChanID, channelState)
 
@@ -1092,7 +1129,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 	case markedOpen:
 		err := f.sendChannelReady(channel, lnChannel)
 		if err != nil {
-			return fmt.Errorf("failed sending channelReady: %v",
+			return fmt.Errorf("failed sending channelReady: %w",
 				err)
 		}
 
@@ -1106,7 +1143,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 		)
 		if err != nil {
 			return fmt.Errorf("error setting channel state to"+
-				" channelReadySent: %v", err)
+				" channelReadySent: %w", err)
 		}
 
 		log.Debugf("Channel(%v) with ShortChanID %v: successfully "+
@@ -1115,7 +1152,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 		return nil
 
 	// channelReady was sent to peer, but the channel was not added to the
-	// router graph and the channel announcement was not sent.
+	// graph and the channel announcement was not sent.
 	case channelReadySent:
 		// We must wait until we've received the peer's channel_ready
 		// before sending a channel_update according to BOLT#07.
@@ -1146,12 +1183,12 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 
 	// The channel was added to the Router's topology, but the channel
 	// announcement was not sent.
-	case addedToRouterGraph:
+	case addedToGraph:
 		if channel.IsZeroConf() {
 			// If this is a zero-conf channel, then we will wait
 			// for it to be confirmed before announcing it to the
 			// greater network.
-			err := f.waitForZeroConfChannel(channel, pendingChanID)
+			err := f.waitForZeroConfChannel(channel)
 			if err != nil {
 				return fmt.Errorf("failed waiting for zero "+
 					"channel: %v", err)
@@ -1176,7 +1213,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 		// shutdown.
 		err = f.deleteChannelOpeningState(&channel.FundingOutpoint)
 		if err != nil {
-			return fmt.Errorf("error deleting channel state: %v",
+			return fmt.Errorf("error deleting channel state: %w",
 				err)
 		}
 
@@ -1242,7 +1279,7 @@ func (f *Manager) advancePendingChannelState(
 
 		// Find and close the discoverySignal for this channel such
 		// that ChannelReady messages will be processed.
-		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 		discoverySignal, ok := f.localDiscoverySignals.Load(chanID)
 		if ok {
 			close(discoverySignal)
@@ -1308,7 +1345,7 @@ func (f *Manager) advancePendingChannelState(
 	}
 
 	// Success, funding transaction was confirmed.
-	chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 	log.Debugf("ChannelID(%v) is now fully confirmed! "+
 		"(shortChanID=%v)", chanID, confChannel.shortChanID)
 
@@ -1519,6 +1556,8 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 			// Fail the funding flow.
 			flowErr := fmt.Errorf("channel acceptor blocked " +
 				"zero-conf channel negotiation")
+			log.Errorf("Cancelling funding flow for %v based on "+
+				"channel acceptor response: %v", cid, flowErr)
 			f.failFundingFlow(peer, cid, flowErr)
 			return
 		}
@@ -1533,6 +1572,9 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 				// Fail the funding flow.
 				flowErr := fmt.Errorf("scid-alias feature " +
 					"must be negotiated for zero-conf")
+				log.Errorf("Cancelling funding flow for "+
+					"zero-conf channel %v: %v", cid,
+					flowErr)
 				f.failFundingFlow(peer, cid, flowErr)
 				return
 			}
@@ -1549,7 +1591,8 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	case public && scid:
 		err = fmt.Errorf("option-scid-alias chantype for public " +
 			"channel")
-		log.Error(err)
+		log.Errorf("Cancelling funding flow for public channel %v "+
+			"with scid-alias: %v", cid, err)
 		f.failFundingFlow(peer, cid, err)
 
 		return
@@ -1558,7 +1601,8 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	// unadvertised channels for now.
 	case commitType.IsTaproot() && public:
 		err = fmt.Errorf("taproot channel type for public channel")
-		log.Error(err)
+		log.Errorf("Cancelling funding flow for public taproot "+
+			"channel %v: %v", cid, err)
 		f.failFundingFlow(peer, cid, err)
 
 		return
@@ -1655,7 +1699,7 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	if err != nil {
 		f.failFundingFlow(
 			peer, cid,
-			fmt.Errorf("getUpfrontShutdownScript error: %v", err),
+			fmt.Errorf("getUpfrontShutdownScript error: %w", err),
 		)
 		return
 	}
@@ -1800,17 +1844,17 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	}
 
 	if resCtx.reservation.IsTaproot() {
-		if msg.LocalNonce == nil {
-			err := fmt.Errorf("local nonce not set for taproot " +
-				"chan")
-			log.Error(err)
-			f.failFundingFlow(
-				resCtx.peer, cid, err,
-			)
+		localNonce, err := msg.LocalNonce.UnwrapOrErrV(errNoLocalNonce)
+		if err != nil {
+			log.Error(errNoLocalNonce)
+
+			f.failFundingFlow(resCtx.peer, cid, errNoLocalNonce)
+
+			return
 		}
 
 		remoteContribution.LocalNonce = &musig2.Nonces{
-			PubNonce: *msg.LocalNonce,
+			PubNonce: localNonce,
 		}
 	}
 
@@ -1825,13 +1869,6 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		msg.PendingChannelID)
 	log.Debugf("Remote party accepted commitment constraints: %v",
 		spew.Sdump(remoteContribution.ChannelConfig.ChannelConstraints))
-
-	var localNonce *lnwire.Musig2Nonce
-	if commitType.IsTaproot() {
-		localNonce = (*lnwire.Musig2Nonce)(
-			&ourContribution.LocalNonce.PubNonce,
-		)
-	}
 
 	// With the initiator's contribution recorded, respond with our
 	// contribution in the next message of the workflow.
@@ -1853,7 +1890,12 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		UpfrontShutdownScript: ourContribution.UpfrontShutdown,
 		ChannelType:           chanType,
 		LeaseExpiry:           msg.LeaseExpiry,
-		LocalNonce:            localNonce,
+	}
+
+	if commitType.IsTaproot() {
+		fundingAccept.LocalNonce = lnwire.SomeMusig2Nonce(
+			ourContribution.LocalNonce.PubNonce,
+		)
 	}
 
 	if err := peer.SendMessage(true, &fundingAccept); err != nil {
@@ -1978,19 +2020,22 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 		return
 	}
 
-	// Fail early if minimum depth is set to 0 and the channel is not
-	// zero-conf.
-	if !resCtx.reservation.IsZeroConf() && msg.MinAcceptDepth == 0 {
-		err = fmt.Errorf("non-zero-conf channel has min depth zero")
-		log.Warn(err)
-		f.failFundingFlow(peer, cid, err)
-		return
+	// If this is not a zero-conf channel but the peer responded with a
+	// min-depth of zero, we will use our minimum of 1 instead.
+	minDepth := msg.MinAcceptDepth
+	if !resCtx.reservation.IsZeroConf() && minDepth == 0 {
+		log.Infof("Responder to pending_id=%v sent a minimum "+
+			"confirmation depth of 0 for non-zero-conf channel. "+
+			"We will use a minimum depth of 1 instead.",
+			cid.tempChanID)
+
+		minDepth = 1
 	}
 
 	// We'll also specify the responder's preference for the number of
 	// required confirmations, and also the set of channel constraints
 	// they've specified for commitment states we can create.
-	resCtx.reservation.SetNumConfsRequired(uint16(msg.MinAcceptDepth))
+	resCtx.reservation.SetNumConfsRequired(uint16(minDepth))
 	channelConstraints := &channeldb.ChannelConstraints{
 		DustLimit:        msg.DustLimit,
 		ChanReserve:      msg.ChannelReserve,
@@ -2043,15 +2088,17 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 	}
 
 	if resCtx.reservation.IsTaproot() {
-		if msg.LocalNonce == nil {
-			err := fmt.Errorf("local nonce not set for taproot " +
-				"chan")
-			log.Error(err)
-			f.failFundingFlow(resCtx.peer, cid, err)
+		localNonce, err := msg.LocalNonce.UnwrapOrErrV(errNoLocalNonce)
+		if err != nil {
+			log.Error(errNoLocalNonce)
+
+			f.failFundingFlow(resCtx.peer, cid, errNoLocalNonce)
+
+			return
 		}
 
 		remoteContribution.LocalNonce = &musig2.Nonces{
-			PubNonce: *msg.LocalNonce,
+			PubNonce: localNonce,
 		}
 	}
 
@@ -2215,7 +2262,7 @@ func (f *Manager) continueFundingAccept(resCtx *reservationWithCtx,
 	// properly synchronize with the writeHandler goroutine, we add a new
 	// channel to the barriers map which will be closed once the channel is
 	// fully open.
-	channelID := lnwire.NewChanIDFromOutPoint(outPoint)
+	channelID := lnwire.NewChanIDFromOutPoint(*outPoint)
 	log.Debugf("Creating chan barrier for ChanID(%v)", channelID)
 
 	// The next message that advances the funding flow will reference the
@@ -2262,7 +2309,9 @@ func (f *Manager) continueFundingAccept(resCtx *reservationWithCtx,
 			return
 		}
 
-		fundingCreated.PartialSig = partialSig.ToWireSig()
+		fundingCreated.PartialSig = lnwire.MaybePartialSigWithNonce(
+			partialSig.ToWireSig(),
+		)
 	} else {
 		fundingCreated.CommitSig, err = lnwire.NewSigFromSignature(sig)
 		if err != nil {
@@ -2316,14 +2365,15 @@ func (f *Manager) fundeeProcessFundingCreated(peer lnpeer.Peer,
 	// our internal input.Signature type.
 	var commitSig input.Signature
 	if resCtx.reservation.IsTaproot() {
-		if msg.PartialSig == nil {
-			log.Errorf("partial sig not included: %v", err)
+		partialSig, err := msg.PartialSig.UnwrapOrErrV(errNoPartialSig)
+		if err != nil {
 			f.failFundingFlow(peer, cid, err)
+
 			return
 		}
 
 		commitSig = new(lnwallet.MusigPartialSig).FromWireSig(
-			msg.PartialSig,
+			&partialSig,
 		)
 	} else {
 		commitSig, err = msg.CommitSig.ToSignature()
@@ -2387,7 +2437,7 @@ func (f *Manager) fundeeProcessFundingCreated(peer lnpeer.Peer,
 	// properly synchronize with the writeHandler goroutine, we add a new
 	// channel to the barriers map which will be closed once the channel is
 	// fully open.
-	channelID := lnwire.NewChanIDFromOutPoint(&fundingOut)
+	channelID := lnwire.NewChanIDFromOutPoint(fundingOut)
 	log.Debugf("Creating chan barrier for ChanID(%v)", channelID)
 
 	fundingSigned := &lnwire.FundingSigned{}
@@ -2407,7 +2457,9 @@ func (f *Manager) fundeeProcessFundingCreated(peer lnpeer.Peer,
 			return
 		}
 
-		fundingSigned.PartialSig = partialSig.ToWireSig()
+		fundingSigned.PartialSig = lnwire.MaybePartialSigWithNonce(
+			partialSig.ToWireSig(),
+		)
 	} else {
 		fundingSigned.CommitSig, err = lnwire.NewSigFromSignature(sig)
 		if err != nil {
@@ -2546,7 +2598,7 @@ func (f *Manager) funderProcessFundingSigned(peer lnpeer.Peer,
 	// process the channel confirmation fully before we receive a
 	// channel_ready message.
 	fundingPoint := resCtx.reservation.FundingOutpoint()
-	permChanID := lnwire.NewChanIDFromOutPoint(fundingPoint)
+	permChanID := lnwire.NewChanIDFromOutPoint(*fundingPoint)
 	f.localDiscoverySignals.Store(permChanID, make(chan struct{}))
 
 	// We have to store the forwardingPolicy before the reservation context
@@ -2564,14 +2616,15 @@ func (f *Manager) funderProcessFundingSigned(peer lnpeer.Peer,
 	// our internal input.Signature type.
 	var commitSig input.Signature
 	if resCtx.reservation.IsTaproot() {
-		if msg.PartialSig == nil {
-			log.Errorf("partial sig not included: %v", err)
+		partialSig, err := msg.PartialSig.UnwrapOrErrV(errNoPartialSig)
+		if err != nil {
 			f.failFundingFlow(peer, cid, err)
+
 			return
 		}
 
 		commitSig = new(lnwallet.MusigPartialSig).FromWireSig(
-			msg.PartialSig,
+			&partialSig,
 		)
 	} else {
 		commitSig, err = msg.CommitSig.ToSignature()
@@ -2720,7 +2773,7 @@ func (f *Manager) fundingTimeout(c *channeldb.OpenChannel,
 	if err := c.CloseChannel(
 		closeInfo, channeldb.ChanStatusLocalCloseInitiator,
 	); err != nil {
-		return fmt.Errorf("failed closing channel %v: %v",
+		return fmt.Errorf("failed closing channel %v: %w",
 			c.FundingOutpoint, err)
 	}
 
@@ -2751,7 +2804,7 @@ func (f *Manager) fundingTimeout(c *channeldb.OpenChannel,
 
 		// Create channel identifier and set the channel ID.
 		cid := newChanIdentifier(pendingID)
-		cid.setChanID(lnwire.NewChanIDFromOutPoint(&c.FundingOutpoint))
+		cid.setChanID(lnwire.NewChanIDFromOutPoint(c.FundingOutpoint))
 
 		// TODO(halseth): should this send be made
 		// reliable?
@@ -2916,7 +2969,7 @@ func (f *Manager) waitForFundingConfirmation(
 
 	fundingPoint := completeChan.FundingOutpoint
 	log.Infof("ChannelPoint(%v) is now active: ChannelID(%v)",
-		fundingPoint, lnwire.NewChanIDFromOutPoint(&fundingPoint))
+		fundingPoint, lnwire.NewChanIDFromOutPoint(fundingPoint))
 
 	// With the block height and the transaction index known, we can
 	// construct the compact chanID which is used on the network to unique
@@ -3034,7 +3087,7 @@ func (f *Manager) handleFundingConfirmation(
 	confChannel *confirmedChannel) error {
 
 	fundingPoint := completeChan.FundingOutpoint
-	chanID := lnwire.NewChanIDFromOutPoint(&fundingPoint)
+	chanID := lnwire.NewChanIDFromOutPoint(fundingPoint)
 
 	// TODO(roasbeef): ideally persistent state update for chan above
 	// should be abstracted
@@ -3045,7 +3098,7 @@ func (f *Manager) handleFundingConfirmation(
 	err := f.cfg.Wallet.ValidateChannel(completeChan, confChannel.fundingTx)
 	if err != nil {
 		// TODO(roasbeef): delete chan state?
-		return fmt.Errorf("unable to validate channel: %v", err)
+		return fmt.Errorf("unable to validate channel: %w", err)
 	}
 
 	// Now that the channel has been validated, we'll persist an alias for
@@ -3053,14 +3106,14 @@ func (f *Manager) handleFundingConfirmation(
 	if completeChan.NegotiatedAliasFeature() {
 		aliasScid, err := f.cfg.AliasManager.RequestAlias()
 		if err != nil {
-			return fmt.Errorf("unable to request alias: %v", err)
+			return fmt.Errorf("unable to request alias: %w", err)
 		}
 
 		err = f.cfg.AliasManager.AddLocalAlias(
 			aliasScid, confChannel.shortChanID, true,
 		)
 		if err != nil {
-			return fmt.Errorf("unable to request alias: %v", err)
+			return fmt.Errorf("unable to request alias: %w", err)
 		}
 	}
 
@@ -3110,7 +3163,7 @@ func (f *Manager) handleFundingConfirmation(
 func (f *Manager) sendChannelReady(completeChan *channeldb.OpenChannel,
 	channel *lnwallet.LightningChannel) error {
 
-	chanID := lnwire.NewChanIDFromOutPoint(&completeChan.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(completeChan.FundingOutpoint)
 
 	var peerKey [33]byte
 	copy(peerKey[:], completeChan.IdentityPub.SerializeCompressed())
@@ -3121,7 +3174,7 @@ func (f *Manager) sendChannelReady(completeChan *channeldb.OpenChannel,
 	// will be unable to propose state transitions.
 	nextRevocation, err := channel.NextRevocationKey()
 	if err != nil {
-		return fmt.Errorf("unable to create next revocation: %v", err)
+		return fmt.Errorf("unable to create next revocation: %w", err)
 	}
 	channelReadyMsg := lnwire.NewChannelReady(chanID, nextRevocation)
 
@@ -3152,8 +3205,8 @@ func (f *Manager) sendChannelReady(completeChan *channeldb.OpenChannel,
 		}
 		f.nonceMtx.Unlock()
 
-		channelReadyMsg.NextLocalNonce = (*lnwire.Musig2Nonce)(
-			&localNonce.PubNonce,
+		channelReadyMsg.NextLocalNonce = lnwire.SomeMusig2Nonce(
+			localNonce.PubNonce,
 		)
 	}
 
@@ -3324,20 +3377,20 @@ func (f *Manager) extractAnnounceParams(c *channeldb.OpenChannel) (
 	return fwdMinHTLC, fwdMaxHTLC
 }
 
-// addToRouterGraph sends a ChannelAnnouncement and a ChannelUpdate to the
-// gossiper so that the channel is added to the Router's internal graph.
+// addToGraph sends a ChannelAnnouncement and a ChannelUpdate to the
+// gossiper so that the channel is added to the graph builder's internal graph.
 // These announcement messages are NOT broadcasted to the greater network,
 // only to the channel counter party. The proofs required to announce the
 // channel to the greater network will be created and sent in annAfterSixConfs.
 // The peerAlias is used for zero-conf channels to give the counter-party a
 // ChannelUpdate they understand. ourPolicy may be set for various
 // option-scid-alias channels to re-use the same policy.
-func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
+func (f *Manager) addToGraph(completeChan *channeldb.OpenChannel,
 	shortChanID *lnwire.ShortChannelID,
 	peerAlias *lnwire.ShortChannelID,
 	ourPolicy *models.ChannelEdgePolicy) error {
 
-	chanID := lnwire.NewChanIDFromOutPoint(&completeChan.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(completeChan.FundingOutpoint)
 
 	fwdMinHTLC, fwdMaxHTLC := f.extractAnnounceParams(completeChan)
 
@@ -3362,10 +3415,10 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"ChannelAnnouncement: %v", err)
 			} else {
 				return fmt.Errorf("error sending channel "+
@@ -3382,10 +3435,10 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"ChannelUpdate: %v", err)
 			} else {
 				return fmt.Errorf("error sending channel "+
@@ -3401,8 +3454,8 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 
 // annAfterSixConfs broadcasts the necessary channel announcement messages to
 // the network after 6 confs. Should be called after the channelReady message
-// is sent and the channel is added to the router graph (channelState is
-// 'addedToRouterGraph') and the channel is ready to be used. This is the last
+// is sent and the channel is added to the graph (channelState is
+// 'addedToGraph') and the channel is ready to be used. This is the last
 // step in the channel opening process, and the opening state will be deleted
 // from the database if successful.
 func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
@@ -3428,7 +3481,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 		}
 
 		chanID := lnwire.NewChanIDFromOutPoint(
-			&completeChan.FundingOutpoint,
+			completeChan.FundingOutpoint,
 		)
 		pubKey := peer.PubKey()
 		log.Debugf("Sending our NodeAnnouncement for "+
@@ -3493,7 +3546,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 		}
 
 		fundingPoint := completeChan.FundingOutpoint
-		chanID := lnwire.NewChanIDFromOutPoint(&fundingPoint)
+		chanID := lnwire.NewChanIDFromOutPoint(fundingPoint)
 
 		log.Infof("Announcing ChannelPoint(%v), short_chan_id=%v",
 			&fundingPoint, shortChanID)
@@ -3513,7 +3566,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 			}
 
 			// We'll delete the edge and add it again via
-			// addToRouterGraph. This is because the peer may have
+			// addToGraph. This is because the peer may have
 			// sent us a ChannelUpdate with an alias and we don't
 			// want to relay this.
 			ourPolicy, err := f.cfg.DeleteAliasEdge(baseScid)
@@ -3523,12 +3576,12 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 					err)
 			}
 
-			err = f.addToRouterGraph(
+			err = f.addToGraph(
 				completeChan, &baseScid, nil, ourPolicy,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to re-add to "+
-					"router graph: %v", err)
+					"graph: %v", err)
 			}
 		}
 
@@ -3552,12 +3605,10 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 	return nil
 }
 
-// waitForZeroConfChannel is called when the state is addedToRouterGraph with
+// waitForZeroConfChannel is called when the state is addedToGraph with
 // a zero-conf channel. This will wait for the real confirmation, add the
-// confirmed SCID to the router graph, and then announce after six confs.
-func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel,
-	pendingID [32]byte) error {
-
+// confirmed SCID to the graph, and then announce after six confs.
+func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel) error {
 	// First we'll check whether the channel is confirmed on-chain. If it
 	// is already confirmed, the chainntnfs subsystem will return with the
 	// confirmed tx. Otherwise, we'll wait here until confirmation occurs.
@@ -3573,7 +3624,7 @@ func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel,
 	// occur due to inconsistency in the OpenChannel struct.
 	err = c.Refresh()
 	if err != nil {
-		return fmt.Errorf("unable to refresh channel state: %v", err)
+		return fmt.Errorf("unable to refresh channel state: %w", err)
 	}
 
 	// Now that we have the confirmed transaction and the proper SCID,
@@ -3611,15 +3662,15 @@ func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel,
 		}
 
 		// We'll need to update the graph with the new ShortChannelID
-		// via an addToRouterGraph call. We don't pass in the peer's
+		// via an addToGraph call. We don't pass in the peer's
 		// alias since we'll be using the confirmed SCID from now on
 		// regardless if it's public or not.
-		err = f.addToRouterGraph(
+		err = f.addToGraph(
 			c, &confChan.shortChanID, nil, ourPolicy,
 		)
 		if err != nil {
 			return fmt.Errorf("failed adding confirmed zero-conf "+
-				"SCID to router graph: %v", err)
+				"SCID to graph: %v", err)
 		}
 	}
 
@@ -3823,11 +3874,9 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 			channelReadyMsg.AliasScid = &alias
 
 			if firstVerNonce != nil {
-				wireNonce := (*lnwire.Musig2Nonce)(
-					&firstVerNonce.PubNonce,
+				channelReadyMsg.NextLocalNonce = lnwire.SomeMusig2Nonce( //nolint:lll
+					firstVerNonce.PubNonce,
 				)
-
-				channelReadyMsg.NextLocalNonce = wireNonce
 			}
 
 			err = peer.SendMessage(true, channelReadyMsg)
@@ -3863,7 +3912,7 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 		localNonce, ok := f.pendingMusigNonces[chanID]
 		if !ok {
 			// If there's no pending nonce for this channel ID,
-			// we'll use the one generatd above.
+			// we'll use the one generated above.
 			localNonce = firstVerNonce
 			f.pendingMusigNonces[chanID] = firstVerNonce
 		}
@@ -3872,8 +3921,13 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 		log.Infof("ChanID(%v): applying local+remote musig2 nonces",
 			chanID)
 
-		if msg.NextLocalNonce == nil {
-			log.Errorf("remote nonces are nil")
+		remoteNonce, err := msg.NextLocalNonce.UnwrapOrErrV(
+			errNoLocalNonce,
+		)
+		if err != nil {
+			cid := newChanIdentifier(msg.ChanID)
+			f.sendWarning(peer, cid, err)
+
 			return
 		}
 
@@ -3881,7 +3935,7 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 			chanOpts,
 			lnwallet.WithLocalMusigNonces(localNonce),
 			lnwallet.WithRemoteMusigNonces(&musig2.Nonces{
-				PubNonce: *msg.NextLocalNonce,
+				PubNonce: remoteNonce,
 			}),
 		)
 	}
@@ -3918,13 +3972,13 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 // handleChannelReadyReceived is called once the remote's channelReady message
 // is received and processed. At this stage, we must have sent out our
 // channelReady message, once the remote's channelReady is processed, the
-// channel is now active, thus we change its state to `addedToRouterGraph` to
+// channel is now active, thus we change its state to `addedToGraph` to
 // let the channel start handling routing.
 func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 	scid *lnwire.ShortChannelID, pendingChanID [32]byte,
 	updateChan chan<- *lnrpc.OpenStatusUpdate) error {
 
-	chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 
 	// Since we've sent+received funding locked at this point, we
 	// can clean up the pending musig2 nonce state.
@@ -3941,7 +3995,7 @@ func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 		// we'll just return, letting the next iteration of the loop
 		// check again.
 		var defaultAlias lnwire.ShortChannelID
-		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 		foundAlias, _ := f.cfg.AliasManager.GetPeerAlias(chanID)
 		if foundAlias == defaultAlias {
 			return nil
@@ -3950,9 +4004,9 @@ func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 		peerAlias = &foundAlias
 	}
 
-	err := f.addToRouterGraph(channel, scid, peerAlias, nil)
+	err := f.addToGraph(channel, scid, peerAlias, nil)
 	if err != nil {
-		return fmt.Errorf("failed adding to router graph: %w", err)
+		return fmt.Errorf("failed adding to graph: %w", err)
 	}
 
 	// As the channel is now added to the ChannelRouter's topology, the
@@ -3960,15 +4014,15 @@ func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 	// moved to the last state (actually deleted from the database) after
 	// the channel is finally announced.
 	err = f.saveChannelOpeningState(
-		&channel.FundingOutpoint, addedToRouterGraph, scid,
+		&channel.FundingOutpoint, addedToGraph, scid,
 	)
 	if err != nil {
 		return fmt.Errorf("error setting channel state to"+
-			" addedToRouterGraph: %w", err)
+			" addedToGraph: %w", err)
 	}
 
 	log.Debugf("Channel(%v) with ShortChanID %v: successfully "+
-		"added to router graph", chanID, scid)
+		"added to graph", chanID, scid)
 
 	// Give the caller a final update notifying them that the channel is
 	fundingPoint := channel.FundingOutpoint
@@ -4293,17 +4347,17 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 	}
 
 	// We only send the channel proof announcement and the node announcement
-	// because addToRouterGraph previously sent the ChannelAnnouncement and
+	// because addToGraph previously sent the ChannelAnnouncement and
 	// the ChannelUpdate announcement messages. The channel proof and node
 	// announcements are broadcast to the greater network.
 	errChan := f.cfg.SendAnnouncement(ann.chanProof)
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"AnnounceSignatures: %v", err)
 			} else {
 				log.Errorf("Unable to send channel "+
@@ -4330,10 +4384,10 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"NodeAnnouncement: %v", err)
 			} else {
 				log.Errorf("Unable to send node "+
@@ -4560,10 +4614,26 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 		MinConfs:          msg.MinConfs,
 		CommitType:        commitType,
 		ChanFunder:        msg.ChanFunder,
-		ZeroConf:          zeroConf,
-		OptionScidAlias:   scid,
-		ScidAliasFeature:  scidFeatureVal,
-		Memo:              msg.Memo,
+		// Unconfirmed Utxos which are marked by the sweeper subsystem
+		// are excluded from the coin selection because they are not
+		// final and can be RBFed by the sweeper subsystem.
+		AllowUtxoForFunding: func(u lnwallet.Utxo) bool {
+			// Utxos with at least 1 confirmation are safe to use
+			// for channel openings because they don't bare the risk
+			// of being replaced (BIP 125 RBF).
+			if u.Confirmations > 0 {
+				return true
+			}
+
+			// Query the sweeper storage to make sure we don't use
+			// an unconfirmed utxo still in use by the sweeper
+			// subsystem.
+			return !f.cfg.IsSweeperOutpoint(u.OutPoint)
+		},
+		ZeroConf:         zeroConf,
+		OptionScidAlias:  scid,
+		ScidAliasFeature: scidFeatureVal,
+		Memo:             msg.Memo,
 	}
 
 	reservation, err := f.cfg.Wallet.InitChannelReservation(req)
@@ -4713,13 +4783,6 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 	log.Infof("Starting funding workflow with %v for pending_id(%x), "+
 		"committype=%v", msg.Peer.Address(), chanID, commitType)
 
-	var localNonce *lnwire.Musig2Nonce
-	if commitType.IsTaproot() {
-		localNonce = (*lnwire.Musig2Nonce)(
-			&ourContribution.LocalNonce.PubNonce,
-		)
-	}
-
 	fundingOpen := lnwire.OpenChannel{
 		ChainHash:             *f.cfg.Wallet.Cfg.NetParams.GenesisHash,
 		PendingChannelID:      chanID,
@@ -4742,10 +4805,16 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 		UpfrontShutdownScript: shutdown,
 		ChannelType:           chanType,
 		LeaseExpiry:           leaseExpiry,
-		LocalNonce:            localNonce,
 	}
+
+	if commitType.IsTaproot() {
+		fundingOpen.LocalNonce = lnwire.SomeMusig2Nonce(
+			ourContribution.LocalNonce.PubNonce,
+		)
+	}
+
 	if err := msg.Peer.SendMessage(true, &fundingOpen); err != nil {
-		e := fmt.Errorf("unable to send funding request message: %v",
+		e := fmt.Errorf("unable to send funding request message: %w",
 			err)
 		log.Errorf(e.Error())
 
@@ -4837,7 +4906,7 @@ func (f *Manager) pruneZombieReservations() {
 		log.Warnf(err.Error())
 
 		chanID := lnwire.NewChanIDFromOutPoint(
-			resCtx.reservation.FundingOutpoint(),
+			*resCtx.reservation.FundingOutpoint(),
 		)
 
 		// Create channel identifier and set the channel ID.

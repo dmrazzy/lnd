@@ -40,7 +40,8 @@ type Registry interface {
 type OnionProcessor interface {
 	// ReconstructHopIterator attempts to decode a valid sphinx packet from
 	// the passed io.Reader instance.
-	ReconstructHopIterator(r io.Reader, rHash []byte) (hop.Iterator, error)
+	ReconstructHopIterator(r io.Reader, rHash []byte,
+		blindingInfo hop.ReconstructBlindingInfo) (hop.Iterator, error)
 }
 
 // UtxoSweeper defines the sweep functions that contract court requires.
@@ -48,12 +49,6 @@ type UtxoSweeper interface {
 	// SweepInput sweeps inputs back into the wallet.
 	SweepInput(input input.Input, params sweep.Params) (chan sweep.Result,
 		error)
-
-	// CreateSweepTx accepts a list of inputs and signs and generates a txn
-	// that spends from them. This method also makes an accurate fee
-	// estimate before generating the required witnesses.
-	CreateSweepTx(inputs []input.Input, feePref sweep.FeePreference,
-		currentBlockHeight uint32) (*wire.MsgTx, error)
 
 	// RelayFeePerKW returns the minimum fee rate required for transactions
 	// to be relayed.
@@ -64,7 +59,7 @@ type UtxoSweeper interface {
 	// fee preference that will be used for a new sweep transaction of the
 	// input that will act as a replacement transaction (RBF) of the
 	// original sweeping transaction, if any.
-	UpdateParams(input wire.OutPoint, params sweep.ParamsUpdate) (
+	UpdateParams(input wire.OutPoint, params sweep.Params) (
 		chan sweep.Result, error)
 }
 

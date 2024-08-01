@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 var (
@@ -139,6 +141,14 @@ const (
 	// transactions, which also imply anchor commitments.
 	AnchorsZeroFeeHtlcTxOptional FeatureBit = 23
 
+	// RouteBlindingRequired is a required feature bit that signals that
+	// the node supports blinded payments.
+	RouteBlindingRequired FeatureBit = 24
+
+	// RouteBlindingOptional is an optional feature bit that signals that
+	// the node supports blinded payments.
+	RouteBlindingOptional FeatureBit = 25
+
 	// ShutdownAnySegwitRequired is an required feature bit that signals
 	// that the sender is able to properly handle/parse segwit witness
 	// programs up to version 16. This enables utilization of Taproot
@@ -213,7 +223,7 @@ const (
 	// able and willing to accept keysend payments.
 	KeysendOptional = 55
 
-	// ScriptEnforcedLeaseOptional is an optional feature bit that signals
+	// ScriptEnforcedLeaseRequired is a required feature bit that signals
 	// that the node requires channels having zero-fee second-level HTLC
 	// transactions, which also imply anchor commitments, along with an
 	// additional CLTV constraint of a channel lease's expiration height
@@ -231,18 +241,17 @@ const (
 	// TODO: Decide on actual feature bit value.
 	ScriptEnforcedLeaseOptional FeatureBit = 2023
 
-	// SimpleTaprootChannelsRequredFinal is a required bit that indicates
+	// SimpleTaprootChannelsRequiredFinal is a required bit that indicates
 	// the node is able to create taproot-native channels. This is the
 	// final feature bit to be used once the channel type is finalized.
 	SimpleTaprootChannelsRequiredFinal = 80
 
 	// SimpleTaprootChannelsOptionalFinal is an optional bit that indicates
 	// the node is able to create taproot-native channels. This is the
-	// final
-	// feature bit to be used once the channel type is finalized.
+	// final feature bit to be used once the channel type is finalized.
 	SimpleTaprootChannelsOptionalFinal = 81
 
-	// SimpleTaprootChannelsRequredStaging is a required bit that indicates
+	// SimpleTaprootChannelsRequiredStaging is a required bit that indicates
 	// the node is able to create taproot-native channels. This is a
 	// feature bit used in the wild while the channel type is still being
 	// finalized.
@@ -250,10 +259,19 @@ const (
 
 	// SimpleTaprootChannelsOptionalStaging is an optional bit that
 	// indicates the node is able to create taproot-native channels. This
-	// is a feature
-	// bit used in the wild while the channel type is still being
-	// finalized.
+	// is a feature bit used in the wild while the channel type is still
+	// being finalized.
 	SimpleTaprootChannelsOptionalStaging = 181
+
+	// Bolt11BlindedPathsRequired is a required feature bit that indicates
+	// that the node is able to understand the blinded path tagged field in
+	// a BOLT 11 invoice.
+	Bolt11BlindedPathsRequired = 260
+
+	// Bolt11BlindedPathsOptional is an optional feature bit that indicates
+	// that the node is able to understand the blinded path tagged field in
+	// a BOLT 11 invoice.
+	Bolt11BlindedPathsOptional = 261
 
 	// MaxBolt11Feature is the maximum feature bit value allowed in bolt 11
 	// invoices.
@@ -313,12 +331,16 @@ var Features = map[FeatureBit]string{
 	ScidAliasOptional:                    "scid-alias",
 	ZeroConfRequired:                     "zero-conf",
 	ZeroConfOptional:                     "zero-conf",
+	RouteBlindingRequired:                "route-blinding",
+	RouteBlindingOptional:                "route-blinding",
 	ShutdownAnySegwitRequired:            "shutdown-any-segwit",
 	ShutdownAnySegwitOptional:            "shutdown-any-segwit",
 	SimpleTaprootChannelsRequiredFinal:   "simple-taproot-chans",
 	SimpleTaprootChannelsOptionalFinal:   "simple-taproot-chans",
 	SimpleTaprootChannelsRequiredStaging: "simple-taproot-chans-x",
 	SimpleTaprootChannelsOptionalStaging: "simple-taproot-chans-x",
+	Bolt11BlindedPathsOptional:           "bolt-11-blinded-paths",
+	Bolt11BlindedPathsRequired:           "bolt-11-blinded-paths",
 }
 
 // RawFeatureVector represents a set of feature bits as defined in BOLT-09.  A
@@ -612,6 +634,41 @@ func (fv *RawFeatureVector) decode(r io.Reader, length, width int) error {
 	return nil
 }
 
+// sizeFunc returns the length required to encode the feature vector.
+func (fv *RawFeatureVector) sizeFunc() uint64 {
+	return uint64(fv.SerializeSize())
+}
+
+// Record returns a TLV record that can be used to encode/decode raw feature
+// vectors. Note that the length of the feature vector is not included, because
+// it is covered by the TLV record's length field.
+func (fv *RawFeatureVector) Record(recordType tlv.Type) tlv.Record {
+	return tlv.MakeDynamicRecord(
+		recordType, fv, fv.sizeFunc, rawFeatureEncoder,
+		rawFeatureDecoder,
+	)
+}
+
+// rawFeatureEncoder is a custom TLV encoder for raw feature vectors.
+func rawFeatureEncoder(w io.Writer, val interface{}, _ *[8]byte) error {
+	if f, ok := val.(*RawFeatureVector); ok {
+		return f.encode(w, f.SerializeSize(), 8)
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "*lnwire.RawFeatureVector")
+}
+
+// rawFeatureDecoder is a custom TLV decoder for raw feature vectors.
+func rawFeatureDecoder(r io.Reader, val interface{}, _ *[8]byte,
+	l uint64) error {
+
+	if f, ok := val.(*RawFeatureVector); ok {
+		return f.decode(r, int(l), 8)
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "*lnwire.RawFeatureVector")
+}
+
 // FeatureVector represents a set of enabled features. The set stores
 // information on enabled flags and metadata about the feature names. A feature
 // vector is serializable to a compact byte representation that is included in
@@ -639,6 +696,50 @@ func NewFeatureVector(featureVector *RawFeatureVector,
 // EmptyFeatureVector returns a feature vector with no bits set.
 func EmptyFeatureVector() *FeatureVector {
 	return NewFeatureVector(nil, Features)
+}
+
+// Record implements the RecordProducer interface for FeatureVector. Note that
+// it uses a zero-value type is used to produce the record, as we expect this
+// type value to be overwritten when used in generic TLV record production.
+// This allows a single Record function to serve in the many different contexts
+// in which feature vectors are encoded. This record wraps the encoding/
+// decoding for our raw feature vectors so that we can directly parse fully
+// formed feature vector types.
+func (fv *FeatureVector) Record() tlv.Record {
+	return tlv.MakeDynamicRecord(0, fv, fv.sizeFunc,
+		func(w io.Writer, val interface{}, buf *[8]byte) error {
+			if f, ok := val.(*FeatureVector); ok {
+				return rawFeatureEncoder(
+					w, f.RawFeatureVector, buf,
+				)
+			}
+
+			return tlv.NewTypeForEncodingErr(
+				val, "*lnwire.FeatureVector",
+			)
+		},
+		func(r io.Reader, val interface{}, buf *[8]byte,
+			l uint64) error {
+
+			if f, ok := val.(*FeatureVector); ok {
+				features := NewFeatureVector(nil, Features)
+				err := rawFeatureDecoder(
+					r, features.RawFeatureVector, buf, l,
+				)
+				if err != nil {
+					return err
+				}
+
+				*f = *features
+
+				return nil
+			}
+
+			return tlv.NewTypeForDecodingErr(
+				val, "*lnwire.FeatureVector", l, l,
+			)
+		},
+	)
 }
 
 // HasFeature returns whether a particular feature is included in the set. The
@@ -676,6 +777,18 @@ func (fv *FeatureVector) UnknownRequiredFeatures() []FeatureBit {
 		}
 	}
 	return unknown
+}
+
+// UnknownFeatures returns a boolean if a feature vector contains *any*
+// unknown features (even if they are odd).
+func (fv *FeatureVector) UnknownFeatures() bool {
+	for feature := range fv.features {
+		if !fv.IsKnown(feature) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Name returns a string identifier for the feature represented by this bit. If

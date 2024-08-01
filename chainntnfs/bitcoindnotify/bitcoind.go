@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/queue"
 )
 
@@ -150,7 +151,12 @@ func (b *BitcoindNotifier) Stop() error {
 
 		close(epochClient.epochChan)
 	}
-	b.txNotifier.TearDown()
+
+	// The txNotifier is only initialized in the start method therefore we
+	// need to make sure we don't access a nil pointer here.
+	if b.txNotifier != nil {
+		b.txNotifier.TearDown()
+	}
 
 	// Stop the mempool notifier.
 	b.memNotifier.TearDown()
@@ -613,7 +619,7 @@ func (b *BitcoindNotifier) confDetailsManually(confRequest chainntnfs.ConfReques
 			}
 
 			return &chainntnfs.TxConfirmation{
-				Tx:          tx,
+				Tx:          tx.Copy(),
 				BlockHash:   blockHash,
 				BlockHeight: height,
 				TxIndex:     uint32(txIndex),
@@ -636,7 +642,7 @@ func (b *BitcoindNotifier) handleBlockConnected(block chainntnfs.BlockEpoch) err
 	// clients.
 	rawBlock, err := b.GetBlock(block.Hash)
 	if err != nil {
-		return fmt.Errorf("unable to get block: %v", err)
+		return fmt.Errorf("unable to get block: %w", err)
 	}
 	utilBlock := btcutil.NewBlock(rawBlock)
 
@@ -645,7 +651,7 @@ func (b *BitcoindNotifier) handleBlockConnected(block chainntnfs.BlockEpoch) err
 	// us.
 	err = b.txNotifier.ConnectTip(utilBlock, uint32(block.Height))
 	if err != nil {
-		return fmt.Errorf("unable to connect tip: %v", err)
+		return fmt.Errorf("unable to connect tip: %w", err)
 	}
 
 	chainntnfs.Log.Infof("New block: height=%v, sha=%v", block.Height,
@@ -719,7 +725,8 @@ func (b *BitcoindNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 			pkScript, b.chainParams,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse script: %v", err)
+			return nil, fmt.Errorf("unable to parse script: %w",
+				err)
 		}
 		if err := b.chainConn.NotifyReceived(addrs); err != nil {
 			return nil, err
@@ -791,8 +798,8 @@ func (b *BitcoindNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 		// proceed with fallback methods.
 		jsonErr, ok := err.(*btcjson.RPCError)
 		if !ok || jsonErr.Code != btcjson.ErrRPCNoTxInfo {
-			return nil, fmt.Errorf("unable to query for txid %v: %v",
-				outpoint.Hash, err)
+			return nil, fmt.Errorf("unable to query for txid "+
+				"%v: %w", outpoint.Hash, err)
 		}
 	}
 
@@ -874,11 +881,13 @@ func (b *BitcoindNotifier) historicalSpendDetails(
 				continue
 			}
 
-			txHash := tx.TxHash()
+			txCopy := tx.Copy()
+			txHash := txCopy.TxHash()
+			spendOutPoint := &txCopy.TxIn[inputIdx].PreviousOutPoint
 			return &chainntnfs.SpendDetail{
-				SpentOutPoint:     &tx.TxIn[inputIdx].PreviousOutPoint,
+				SpentOutPoint:     spendOutPoint,
 				SpenderTxHash:     &txHash,
-				SpendingTx:        tx,
+				SpendingTx:        txCopy,
 				SpenderInputIndex: inputIdx,
 				SpendingHeight:    int32(height),
 			}, nil
@@ -1066,4 +1075,27 @@ func (b *BitcoindNotifier) CancelMempoolSpendEvent(
 	sub *chainntnfs.MempoolSpendEvent) {
 
 	b.memNotifier.UnsubscribeEvent(sub)
+}
+
+// LookupInputMempoolSpend takes an outpoint and queries the mempool to find
+// its spending tx. Returns the tx if found, otherwise fn.None.
+//
+// NOTE: part of the MempoolWatcher interface.
+func (b *BitcoindNotifier) LookupInputMempoolSpend(
+	op wire.OutPoint) fn.Option[wire.MsgTx] {
+
+	// Find the spending txid.
+	txid, found := b.chainConn.LookupInputMempoolSpend(op)
+	if !found {
+		return fn.None[wire.MsgTx]()
+	}
+
+	// Query the spending tx using the id.
+	tx, err := b.chainConn.GetRawTransaction(&txid)
+	if err != nil {
+		// TODO(yy): enable logging errors in this package.
+		return fn.None[wire.MsgTx]()
+	}
+
+	return fn.Some(*tx.MsgTx().Copy())
 }

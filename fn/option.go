@@ -1,5 +1,7 @@
 package fn
 
+import "testing"
+
 // Option[A] represents a value which may or may not be there. This is very
 // often preferable to nil-able pointers.
 type Option[A any] struct {
@@ -46,6 +48,48 @@ func (o Option[A]) UnwrapOr(a A) A {
 	}
 
 	return a
+}
+
+// UnwrapOrFunc is used to extract a value from an option, and we supply a
+// thunk to be evaluated in the case when the Option is empty.
+func (o Option[A]) UnwrapOrFunc(f func() A) A {
+	return ElimOption(o, f, func(a A) A { return a })
+}
+
+// UnwrapOrFail is used to extract a value from an option within a test
+// context. If the option is None, then the test fails.
+func (o Option[A]) UnwrapOrFail(t *testing.T) A {
+	t.Helper()
+
+	if o.isSome {
+		return o.some
+	}
+
+	t.Fatalf("Option[%T] was None()", o.some)
+
+	var zero A
+	return zero
+}
+
+// UnwrapOrErr is used to extract a value from an option, if the option is
+// empty, then the specified error is returned directly.
+func (o Option[A]) UnwrapOrErr(err error) (A, error) {
+	if !o.isSome {
+		var zero A
+		return zero, err
+	}
+
+	return o.some, nil
+}
+
+// UnwrapOrFuncErr is used to extract a value from an option, and we supply a
+// thunk to be evaluated in the case when the Option is empty.
+func (o Option[A]) UnwrapOrFuncErr(f func() (A, error)) (A, error) {
+	if o.isSome {
+		return o.some, nil
+	}
+
+	return f()
 }
 
 // WhenSome is used to conditionally perform a side-effecting function that
@@ -117,6 +161,19 @@ func MapOption[A, B any](f func(A) B) func(Option[A]) Option[B] {
 	}
 }
 
+// MapOptionZ transforms a pure function A -> B into one that will operate
+// inside the Option context. Unlike MapOption, this function will return the
+// default/zero argument of the return type if the Option is empty.
+func MapOptionZ[A, B any](o Option[A], f func(A) B) B {
+	var zero B
+
+	if o.IsNone() {
+		return zero
+	}
+
+	return f(o.some)
+}
+
 // LiftA2Option transforms a pure function (A, B) -> C into one that will
 // operate in an Option context. For the returned function, if either of its
 // arguments are None, then the result will be None.
@@ -146,4 +203,33 @@ func (o Option[A]) Alt(o2 Option[A]) Option[A] {
 	}
 
 	return o2
+}
+
+// UnsafeFromSome can be used to extract the internal value. This will panic
+// if the value is None() though.
+func (o Option[A]) UnsafeFromSome() A {
+	if o.isSome {
+		return o.some
+	}
+	panic("Option was None()")
+}
+
+// OptionToLeft can be used to convert an Option value into an Either, by
+// providing the Right value that should be used if the Option value is None.
+func OptionToLeft[O, L, R any](o Option[O], r R) Either[O, R] {
+	if o.IsSome() {
+		return NewLeft[O, R](o.some)
+	}
+
+	return NewRight[O, R](r)
+}
+
+// OptionToRight can be used to convert an Option value into an Either, by
+// providing the Left value that should be used if the Option value is None.
+func OptionToRight[O, L, R any](o Option[O], l L) Either[L, O] {
+	if o.IsSome() {
+		return NewRight[L, O](o.some)
+	}
+
+	return NewLeft[L, O](l)
 }

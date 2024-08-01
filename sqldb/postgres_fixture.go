@@ -1,15 +1,19 @@
+//go:build !js && !(windows && (arm || 386)) && !(linux && (ppc64 || mips || mipsle || mips64)) && !(netbsd || openbsd)
+
 package sqldb
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq" // Import the postgres driver.
+	_ "github.com/jackc/pgx/v5"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/require"
@@ -55,6 +59,7 @@ func NewTestPgFixture(t *testing.T, expiry time.Duration) *TestPgFixture {
 			"postgres",
 			"-c", "log_statement=all",
 			"-c", "log_destination=stderr",
+			"-c", "max_connections=1000",
 		},
 	}, func(config *docker.HostConfig) {
 		// Set AutoRemove to true so that stopped container goes away
@@ -74,7 +79,7 @@ func NewTestPgFixture(t *testing.T, expiry time.Duration) *TestPgFixture {
 		host: host,
 		port: int(port),
 	}
-	databaseURL := fixture.GetDSN()
+	databaseURL := fixture.GetConfig(testPgDBName).Dsn
 	log.Infof("Connecting to Postgres fixture: %v\n", databaseURL)
 
 	// Tell docker to hard kill the container in "expiry" seconds.
@@ -86,7 +91,7 @@ func NewTestPgFixture(t *testing.T, expiry time.Duration) *TestPgFixture {
 
 	var testDB *sql.DB
 	err = pool.Retry(func() error {
-		testDB, err = sql.Open("postgres", databaseURL)
+		testDB, err = sql.Open("pgx", databaseURL)
 		if err != nil {
 			return err
 		}
@@ -103,20 +108,13 @@ func NewTestPgFixture(t *testing.T, expiry time.Duration) *TestPgFixture {
 	return fixture
 }
 
-// GetDSN returns the DSN (Data Source Name) for the started Postgres node.
-func (f *TestPgFixture) GetDSN() string {
-	return f.GetConfig().DSN(false)
-}
-
 // GetConfig returns the full config of the Postgres node.
-func (f *TestPgFixture) GetConfig() *PostgresConfig {
+func (f *TestPgFixture) GetConfig(dbName string) *PostgresConfig {
 	return &PostgresConfig{
-		Host:       f.host,
-		Port:       f.port,
-		User:       testPgUser,
-		Password:   testPgPass,
-		DBName:     testPgDBName,
-		RequireSSL: false,
+		Dsn: fmt.Sprintf(
+			"postgres://%v:%v@%v:%v/%v?sslmode=disable",
+			testPgUser, testPgPass, f.host, f.port, dbName,
+		),
 	}
 }
 
@@ -126,15 +124,59 @@ func (f *TestPgFixture) TearDown(t *testing.T) {
 	require.NoError(t, err, "Could not purge resource")
 }
 
-// ClearDB clears the database.
-func (f *TestPgFixture) ClearDB(t *testing.T) {
-	dbConn, err := sql.Open("postgres", f.GetDSN())
+// randomDBName generates a random database name.
+func randomDBName(t *testing.T) string {
+	randBytes := make([]byte, 8)
+	_, err := rand.Read(randBytes)
 	require.NoError(t, err)
 
-	_, err = dbConn.ExecContext(
-		context.Background(),
-		`DROP SCHEMA IF EXISTS public CASCADE;
-		 CREATE SCHEMA public;`,
+	return "test_" + hex.EncodeToString(randBytes)
+}
+
+// NewTestPostgresDB is a helper function that creates a Postgres database for
+// testing using the given fixture.
+func NewTestPostgresDB(t *testing.T, fixture *TestPgFixture) *PostgresStore {
+	t.Helper()
+
+	dbName := randomDBName(t)
+
+	t.Logf("Creating new Postgres DB '%s' for testing", dbName)
+
+	_, err := fixture.db.ExecContext(
+		context.Background(), "CREATE DATABASE "+dbName,
 	)
 	require.NoError(t, err)
+
+	cfg := fixture.GetConfig(dbName)
+	store, err := NewPostgresStore(cfg)
+	require.NoError(t, err)
+
+	return store
+}
+
+// NewTestPostgresDBWithVersion is a helper function that creates a Postgres
+// database for testing and migrates it to the given version.
+func NewTestPostgresDBWithVersion(t *testing.T, fixture *TestPgFixture,
+	version uint) *PostgresStore {
+
+	t.Helper()
+
+	t.Logf("Creating new Postgres DB for testing, migrating to version %d",
+		version)
+
+	dbName := randomDBName(t)
+	_, err := fixture.db.ExecContext(
+		context.Background(), "CREATE DATABASE "+dbName,
+	)
+	require.NoError(t, err)
+
+	storeCfg := fixture.GetConfig(dbName)
+	storeCfg.SkipMigrations = true
+	store, err := NewPostgresStore(storeCfg)
+	require.NoError(t, err)
+
+	err = store.ExecuteMigrations(TargetVersion(version))
+	require.NoError(t, err)
+
+	return store
 }

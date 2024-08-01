@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -14,6 +15,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/rpc"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,9 +31,9 @@ func testOpenChannelAfterReorg(ht *lntest.HarnessTest) {
 	}
 
 	// Create a temp miner.
-	tempMiner := ht.Miner.SpawnTempMiner()
+	tempMiner := ht.SpawnTempMiner()
 
-	miner := ht.Miner
+	miner := ht.Miner()
 	alice, bob := ht.Alice, ht.Bob
 
 	// Create a new channel that requires 1 confs before it's considered
@@ -44,7 +46,7 @@ func testOpenChannelAfterReorg(ht *lntest.HarnessTest) {
 
 	// Wait for miner to have seen the funding tx. The temporary miner is
 	// disconnected, and won't see the transaction.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// At this point, the channel's funding transaction will have been
 	// broadcast, but not confirmed, and the channel should be pending.
@@ -57,8 +59,8 @@ func testOpenChannelAfterReorg(ht *lntest.HarnessTest) {
 	// and our new miner mine 15. This will also confirm our pending
 	// channel on the original miner's chain, which should be considered
 	// open.
-	block := ht.MineBlocks(10)[0]
-	ht.Miner.AssertTxInBlock(block, fundingTxID)
+	block := ht.MineBlocksAndAssertNumTxes(10, 1)[0]
+	ht.AssertTxInBlock(block, fundingTxID)
 	_, err = tempMiner.Client.Generate(15)
 	require.NoError(ht, err, "unable to generate blocks")
 
@@ -114,7 +116,7 @@ func testOpenChannelAfterReorg(ht *lntest.HarnessTest) {
 
 	// Cleanup by mining the funding tx again, then closing the channel.
 	block = ht.MineBlocksAndAssertNumTxes(1, 1)[0]
-	ht.Miner.AssertTxInBlock(block, fundingTxID)
+	ht.AssertTxInBlock(block, fundingTxID)
 
 	ht.CloseChannel(alice, chanPoint)
 }
@@ -766,6 +768,18 @@ func testFundingExpiryBlocksOnPending(ht *lntest.HarnessTest) {
 	// channel.
 	ht.MineBlocksAndAssertNumTxes(1, 1)
 	chanPoint := lntest.ChanPointFromPendingUpdate(update)
+
+	// TODO(yy): remove the sleep once the following bug is fixed.
+	//
+	// We may get the error `unable to gracefully close channel
+	// while peer is offline (try force closing it instead):
+	// channel link not found`. This happens because the channel
+	// link hasn't been added yet but we now proceed to closing the
+	// channel. We may need to revisit how the channel open event
+	// is created and make sure the event is only sent after all
+	// relevant states have been updated.
+	time.Sleep(2 * time.Second)
+
 	ht.CloseChannel(alice, chanPoint)
 }
 
@@ -821,4 +835,66 @@ func testSimpleTaprootChannelActivation(ht *lntest.HarnessTest) {
 
 	// Our test is done and Alice closes her channel to Bob.
 	ht.CloseChannel(alice, chanPoint)
+}
+
+// testOpenChannelLockedBalance tests that when a funding reservation is
+// made for opening a channel, the balance of the required outputs shows
+// up as locked balance in the WalletBalance response.
+func testOpenChannelLockedBalance(ht *lntest.HarnessTest) {
+	var (
+		bob = ht.Bob
+		req *lnrpc.ChannelAcceptRequest
+		err error
+	)
+
+	// Create a new node so we can assert exactly how much fund has been
+	// locked later.
+	alice := ht.NewNode("alice", nil)
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, alice)
+
+	// Connect the nodes.
+	ht.EnsureConnected(alice, bob)
+
+	// We first make sure Alice has no locked wallet balance.
+	balance := alice.RPC.WalletBalance()
+	require.EqualValues(ht, 0, balance.LockedBalance)
+
+	// Next, we register a ChannelAcceptor on Bob. This way, we can get
+	// Alice's wallet balance after coin selection is done and outpoints
+	// are locked.
+	stream, cancel := bob.RPC.ChannelAcceptor()
+	defer cancel()
+
+	// Then, we request creation of a channel from Alice to Bob. We don't
+	// use OpenChannelSync since we want to receive Bob's message in the
+	// same goroutine.
+	openChannelReq := &lnrpc.OpenChannelRequest{
+		NodePubkey:         bob.PubKey[:],
+		LocalFundingAmount: int64(funding.MaxBtcFundingAmount),
+		TargetConf:         6,
+	}
+	_ = alice.RPC.OpenChannel(openChannelReq)
+
+	// After that, we receive the request on Bob's side, get the wallet
+	// balance from Alice, and ensure the locked balance is non-zero.
+	err = wait.NoError(func() error {
+		req, err = stream.Recv()
+		return err
+	}, defaultTimeout)
+	require.NoError(ht, err)
+
+	ht.AssertWalletLockedBalance(alice, btcutil.SatoshiPerBitcoin)
+
+	// Next, we let Bob deny the request.
+	resp := &lnrpc.ChannelAcceptResponse{
+		Accept:        false,
+		PendingChanId: req.PendingChanId,
+	}
+	err = wait.NoError(func() error {
+		return stream.Send(resp)
+	}, defaultTimeout)
+	require.NoError(ht, err)
+
+	// Finally, we check to make sure the balance is unlocked again.
+	ht.AssertWalletLockedBalance(alice, 0)
 }

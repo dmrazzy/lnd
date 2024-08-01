@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	prand "math/rand"
 	"net"
 	"reflect"
 	"runtime"
@@ -186,28 +187,30 @@ func TestChannelLinkRevThenSig(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, restore, err :=
-		newSingleLinkTestHarness(t, chanAmt, chanReserve)
+	harness, err := newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err)
 
-	err = start()
+	err = harness.start()
 	require.NoError(t, err)
-	defer aliceLink.Stop()
+	defer harness.aliceLink.Stop()
 
-	alice := newPersistentLinkHarness(
-		t, aliceLink, batchTicker, restore,
+	alice := newPersistentLinkHarness(t, harness.aliceSwitch,
+		harness.aliceLink, harness.aliceBatchTicker,
+		harness.aliceRestore,
 	)
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint: forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	bobHtlc1 := generateHtlc(t, coreLink, 0)
@@ -239,7 +242,7 @@ func TestChannelLinkRevThenSig(t *testing.T) {
 	// ------sig----x
 	// Trigger a commitsig from Alice->Bob.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -264,10 +267,10 @@ func TestChannelLinkRevThenSig(t *testing.T) {
 	ctx.aliceMsgs = alice.msgs
 
 	// Restart Bob as well by calling NewLightningChannel.
-	bobSigner := bobChannel.Signer
+	bobSigner := harness.bobChannel.Signer
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
-	bobChannel, err = lnwallet.NewLightningChannel(
-		bobSigner, bobChannel.State(), bobPool,
+	bobChannel, err := lnwallet.NewLightningChannel(
+		bobSigner, harness.bobChannel.State(), bobPool,
 	)
 	require.NoError(t, err)
 	err = bobPool.Start()
@@ -318,28 +321,31 @@ func TestChannelLinkSigThenRev(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err)
 
-	err = start()
+	err = harness.start()
 	require.NoError(t, err)
-	defer aliceLink.Stop()
+	defer harness.aliceLink.Stop()
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, batchTicker, restore,
+		t, harness.aliceSwitch, harness.aliceLink,
+		harness.aliceBatchTicker, harness.aliceRestore,
 	)
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint: forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	bobHtlc1 := generateHtlc(t, coreLink, 0)
@@ -357,7 +363,7 @@ func TestChannelLinkSigThenRev(t *testing.T) {
 	// ------sig----x
 	// Trigger a commitsig from Alice->Bob.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -396,10 +402,10 @@ func TestChannelLinkSigThenRev(t *testing.T) {
 	ctx.aliceMsgs = alice.msgs
 
 	// Restart Bob as well by calling NewLightningChannel.
-	bobSigner := bobChannel.Signer
+	bobSigner := harness.bobChannel.Signer
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
-	bobChannel, err = lnwallet.NewLightningChannel(
-		bobSigner, bobChannel.State(), bobPool,
+	bobChannel, err := lnwallet.NewLightningChannel(
+		bobSigner, harness.bobChannel.State(), bobPool,
 	)
 	require.NoError(t, err)
 	err = bobPool.Start()
@@ -438,7 +444,7 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -635,6 +641,206 @@ func testChannelLinkMultiHopPayment(t *testing.T,
 		t.Fatalf("channel bandwidth incorrect: expected %v, got %v",
 			expectedCarolBandwidth, n.carolChannelLink.Bandwidth())
 	}
+}
+
+func TestChannelLinkInboundFee(t *testing.T) {
+	t.Parallel()
+
+	t.Run("negative", func(t *testing.T) {
+		t.Parallel()
+
+		bobInboundFee := models.InboundFee{
+			Base: -500,
+			Rate: -100,
+		}
+
+		// Bob is supposed to sent Carol 1000000 msats. For this, he
+		// will charge an out fee of 1000 msat (the default hop network
+		// policy). Bob's inbound fee is based on the sum of outgoing
+		// htlc amount and the out fee that Bob charges. The value of
+		// this sum is 1001000. The proportional component of the
+		// inbound fee is -0.01% of the sum, which is -100 (rounded
+		// up). Added to this is the base inbound fee of -500, making
+		// for a total inbound fee of -600.
+		const expectedBobInFee = -600
+
+		testChannelLinkInboundFee(
+			t, bobInboundFee, expectedBobInFee, false,
+		)
+	})
+
+	t.Run("negative overpaid", func(t *testing.T) {
+		t.Parallel()
+
+		bobInboundFee := models.InboundFee{
+			Base: -500,
+			Rate: -100,
+		}
+
+		// Alice is not aware of the inbound discount and pays the full
+		// outbound fee.
+		const expectedBobInFee = 0
+
+		testChannelLinkInboundFee(
+			t, bobInboundFee, expectedBobInFee, false,
+		)
+	})
+
+	t.Run("negative total", func(t *testing.T) {
+		t.Parallel()
+
+		bobInboundFee := models.InboundFee{
+			Base: -5000,
+		}
+
+		const expectedBobInFee = -5000
+
+		// Bob's inbound discount exceeds his outbound fee. Forwards
+		// carrying a negative total fee should be rejected.
+		testChannelLinkInboundFee(
+			t, bobInboundFee, expectedBobInFee, true,
+		)
+	})
+
+	t.Run("positive", func(t *testing.T) {
+		t.Parallel()
+
+		bobInboundFee := models.InboundFee{
+			Base: 1_000,
+			Rate: 100_000,
+		}
+
+		const expectedBobInFee = 101_100
+
+		testChannelLinkInboundFee(
+			t, bobInboundFee, expectedBobInFee, false,
+		)
+	})
+}
+
+func testChannelLinkInboundFee(t *testing.T, //nolint:thelper
+	bobInboundFee models.InboundFee, expectedBobInFee int64,
+	expectedFail bool) {
+
+	channels, _, err := createClusterChannels(
+		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
+	)
+	require.NoError(t, err, "unable to create channel")
+
+	n := newThreeHopNetwork(t, channels.aliceToBob, channels.bobToAlice,
+		channels.bobToCarol, channels.carolToBob, testStartingHeight)
+
+	require.NoError(t, n.start())
+	defer n.stop()
+
+	bobPolicy := n.globalPolicy
+	bobPolicy.InboundFee = bobInboundFee
+	n.firstBobChannelLink.UpdateForwardingPolicy(bobPolicy)
+
+	// Set an inbound fee for Carol. Because Carol is the payee, the fee
+	// should not be applied.
+	carolPolicy := n.globalPolicy
+	carolPolicy.InboundFee = models.InboundFee{
+		Base: -2_000,
+		Rate: -200_000,
+	}
+	n.carolChannelLink.UpdateForwardingPolicy(carolPolicy)
+
+	carolBandwidthBefore := n.carolChannelLink.Bandwidth()
+	firstBobBandwidthBefore := n.firstBobChannelLink.Bandwidth()
+	secondBobBandwidthBefore := n.secondBobChannelLink.Bandwidth()
+	aliceBandwidthBefore := n.aliceChannelLink.Bandwidth()
+
+	const (
+		expectedCarolInboundFee = 0
+
+		// Expect Bob's outbound fee to match the default hop network
+		// policy.
+		expectedBobOutboundFee = 1_000
+	)
+
+	amount := lnwire.MilliSatoshi(1_000_000)
+	htlcAmt := lnwire.MilliSatoshi(1_000_000 +
+		expectedCarolInboundFee + expectedBobOutboundFee +
+		expectedBobInFee,
+	)
+	totalTimelock := uint32(112)
+
+	hops := []*hop.Payload{
+		{
+			FwdInfo: hop.ForwardingInfo{
+				NextHop: n.carolChannelLink.
+					ShortChanID(),
+				AmountToForward: 1_000_000,
+				OutgoingCTLV:    106,
+			},
+		},
+		{
+			FwdInfo: hop.ForwardingInfo{
+				AmountToForward: 1_000_000,
+				OutgoingCTLV:    106,
+			},
+		},
+	}
+
+	receiver := n.carolServer
+	firstHop := n.firstBobChannelLink.ShortChanID()
+	rhash, err := makePayment(
+		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
+		totalTimelock,
+	).Wait(30 * time.Second)
+
+	if expectedFail {
+		require.Error(t, err)
+
+		return
+	}
+
+	require.NoError(t, err, "unable to send payment")
+
+	// Wait for Alice and Bob's second link to receive the revocation.
+	time.Sleep(2 * time.Second)
+
+	// Check that Carol invoice was settled and bandwidth of HTLC
+	// links were changed.
+	invoice, err := receiver.registry.LookupInvoice(
+		context.Background(), rhash,
+	)
+	require.NoError(t, err, "unable to get invoice")
+	require.Equal(t, invpkg.ContractSettled, invoice.State,
+		"carol invoice haven't been settled")
+
+	expectedAliceBandwidth := aliceBandwidthBefore - htlcAmt
+	require.Equalf(t,
+		expectedAliceBandwidth, n.aliceChannelLink.Bandwidth(),
+		"channel bandwidth incorrect: expected %v, got %v",
+		expectedAliceBandwidth, n.aliceChannelLink.Bandwidth(),
+	)
+
+	expectedBobBandwidth1 := firstBobBandwidthBefore + htlcAmt
+	require.Equalf(t,
+		expectedBobBandwidth1, n.firstBobChannelLink.Bandwidth(),
+		"channel bandwidth incorrect: expected %v, got %v",
+		expectedBobBandwidth1, n.firstBobChannelLink.Bandwidth(),
+	)
+
+	bobCarolDelta := lnwire.MilliSatoshi(
+		int64(amount) + expectedCarolInboundFee,
+	)
+
+	expectedBobBandwidth2 := secondBobBandwidthBefore - bobCarolDelta
+	require.Equalf(t,
+		expectedBobBandwidth2, n.secondBobChannelLink.Bandwidth(),
+		"channel bandwidth incorrect: expected %v, got %v",
+		expectedBobBandwidth2, n.secondBobChannelLink.Bandwidth(),
+	)
+
+	expectedCarolBandwidth := carolBandwidthBefore + bobCarolDelta
+	require.Equalf(t,
+		expectedCarolBandwidth, n.carolChannelLink.Bandwidth(),
+		"channel bandwidth incorrect: expected %v, got %v",
+		expectedCarolBandwidth, n.carolChannelLink.Bandwidth(),
+	)
 }
 
 // TestChannelLinkCancelFullCommitment tests the ability for links to cancel
@@ -1491,7 +1697,7 @@ func TestChannelLinkMultiHopUnknownNextHop(t *testing.T) {
 	// back the payment to Alice since he is unaware of Carol when the
 	// payment comes across.
 	bobChanID := lnwire.NewChanIDFromOutPoint(
-		&channels.bobToCarol.State().FundingOutpoint,
+		channels.bobToCarol.ChannelPoint(),
 	)
 	n.bobServer.htlcSwitch.RemoveLink(bobChanID)
 
@@ -1914,13 +2120,21 @@ func (m *mockPeer) RemovePendingChannel(_ lnwire.ChannelID) error {
 	return nil
 }
 
-func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount) (
-	ChannelLink, *lnwallet.LightningChannel, chan time.Time, func() error,
-	func() (*lnwallet.LightningChannel, error), error) {
+type singleLinkTestHarness struct {
+	aliceSwitch      *Switch
+	aliceLink        ChannelLink
+	bobChannel       *lnwallet.LightningChannel
+	aliceBatchTicker chan time.Time
+	start            func() error
+	aliceRestore     func() (*lnwallet.LightningChannel, error)
+}
+
+func newSingleLinkTestHarness(t *testing.T, chanAmt,
+	chanReserve btcutil.Amount) (singleLinkTestHarness, error) {
 
 	var chanIDBytes [8]byte
 	if _, err := io.ReadFull(rand.Reader, chanIDBytes[:]); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return singleLinkTestHarness{}, err
 	}
 
 	chanID := lnwire.NewShortChanIDFromInt(
@@ -1931,7 +2145,7 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount)
 		chanReserve, chanReserve, chanID,
 	)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return singleLinkTestHarness{}, err
 	}
 
 	var (
@@ -1955,7 +2169,7 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount)
 	aliceDb := aliceLc.channel.State().Db.GetParentDB()
 	aliceSwitch, err := initSwitchWithDB(testStartingHeight, aliceDb)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return singleLinkTestHarness{}, err
 	}
 
 	notifyUpdateChan := make(chan *contractcourt.ContractUpdate)
@@ -1981,7 +2195,6 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount)
 	aliceCfg := ChannelLinkConfig{
 		FwrdingPolicy: globalPolicy,
 		Peer:          alicePeer,
-		Switch:        aliceSwitch,
 		BestHeight:    aliceSwitch.BestHeight,
 		Circuits:      aliceSwitch.CircuitModifier(),
 		ForwardPackets: func(linkQuit chan struct{}, _ bool, packets ...*htlcPacket) error {
@@ -2007,11 +2220,11 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount)
 		BatchTicker:          bticker,
 		FwdPkgGCTicker:       ticker.NewForce(15 * time.Second),
 		PendingCommitTicker:  ticker.New(time.Minute),
-		// Make the BatchSize and Min/MaxFeeUpdateTimeout large enough
+		// Make the BatchSize and Min/MaxUpdateTimeout large enough
 		// to not trigger commit updates automatically during tests.
 		BatchSize:               10000,
-		MinFeeUpdateTimeout:     30 * time.Minute,
-		MaxFeeUpdateTimeout:     40 * time.Minute,
+		MinUpdateTimeout:        30 * time.Minute,
+		MaxUpdateTimeout:        40 * time.Minute,
 		MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
 		MaxFeeAllocation:        DefaultMaxLinkFeeAllocation,
 		NotifyActiveLink:        func(wire.OutPoint) {},
@@ -2042,8 +2255,16 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt, chanReserve btcutil.Amount)
 		invoiceRegistry.cleanup()
 	})
 
-	return aliceLink, bobLc.channel, bticker.Force, start,
-		aliceLc.restore, nil
+	harness := singleLinkTestHarness{
+		aliceSwitch:      aliceSwitch,
+		aliceLink:        aliceLink,
+		bobChannel:       bobLc.channel,
+		aliceBatchTicker: bticker.Force,
+		start:            start,
+		aliceRestore:     aliceLc.restore,
+	}
+
+	return harness, nil
 }
 
 func assertLinkBandwidth(t *testing.T, link ChannelLink,
@@ -2222,23 +2443,32 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	// We'll start the test by creating a single instance of
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 
-	aliceLink, bobChannel, tmr, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		carolChanID            = lnwire.NewShortChanIDFromInt(3)
-		mockBlob               [lnwire.OnionPacketSize]byte
-		coreChan               = aliceLink.(*channelLink).channel
-		coreLink               = aliceLink.(*channelLink)
-		defaultCommitFee       = coreChan.StateSnapshot().CommitFee
-		aliceStartingBandwidth = aliceLink.Bandwidth()
-		aliceMsgs              = coreLink.cfg.Peer.(*mockPeer).sentMsgs
+		carolChanID  = lnwire.NewShortChanIDFromInt(3)
+		mockBlob     [lnwire.OnionPacketSize]byte
+		coreLink     *channelLink
+		aliceMsgs    chan lnwire.Message
+		chanAmtMSat  = lnwire.NewMSatFromSatoshis(chanAmt)
+		cType        = channeldb.SingleFunderTweaklessBit
+		commitWeight = lnwallet.CommitWeight(cType)
 	)
+
+	link, ok := harness.aliceLink.(*channelLink)
+	require.True(t, ok)
+	coreLink = link
+	mockedPeer := coreLink.cfg.Peer
+
+	peer, ok := mockedPeer.(*mockPeer)
+	require.True(t, ok)
+	aliceMsgs = peer.sentMsgs
 
 	// We put Alice into hodl.ExitSettle mode, such that she won't settle
 	// incoming HTLCs automatically.
@@ -2247,17 +2477,18 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	estimator := chainfee.NewStaticEstimator(6000, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	require.NoError(t, err, "unable to query fee estimator")
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(input.HTLCWeight),
+
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight := lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer := lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
-	// that we created the channel between her and Bob, minus the
-	// commitment fee and fee for adding an additional HTLC.
-	expectedBandwidth := lnwire.NewMSatFromSatoshis(
-		chanAmt-defaultCommitFee,
-	) - htlcFee
-	assertLinkBandwidth(t, aliceLink, expectedBandwidth)
+	// that we created the channel between her and Bob, minus the feebuffer.
+	expectedBandwidth := chanAmtMSat - feeBuffer
+	assertLinkBandwidth(t, harness.aliceLink, expectedBandwidth)
 
 	// Next, we'll create an HTLC worth 1 BTC, and send it into the link as
 	// a switch initiated payment.  The resulting bandwidth should
@@ -2275,18 +2506,25 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	}
 
 	circuit := makePaymentCircuit(&htlc.PaymentHash, &addPkt)
-	_, err = coreLink.cfg.Switch.commitCircuits(&circuit)
+	_, err = harness.aliceSwitch.commitCircuits(&circuit)
 	require.NoError(t, err, "unable to commit circuit")
 
 	addPkt.circuit = &circuit
-	if err := aliceLink.handleSwitchPacket(&addPkt); err != nil {
+	if err := harness.aliceLink.handleSwitchPacket(&addPkt); err != nil {
 		t.Fatalf("unable to handle switch packet: %v", err)
 	}
 	time.Sleep(time.Millisecond * 500)
 
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(2) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// The resulting bandwidth should reflect that Alice is paying the
-	// htlc amount in addition to the htlc fee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	// htlc amount in addition to the fee buffer.
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// Alice should send the HTLC to Bob.
 	var msg lnwire.Message
@@ -2301,39 +2539,52 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 		t.Fatalf("expected UpdateAddHTLC, got %T", msg)
 	}
 
-	bobIndex, err := bobChannel.ReceiveHTLC(addHtlc)
+	bobIndex, err := harness.bobChannel.ReceiveHTLC(addHtlc)
 	require.NoError(t, err, "bob failed receiving htlc")
 
 	// Lock in the HTLC.
-	if err := updateState(tmr, coreLink, bobChannel, true); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, true,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 	// Locking in the HTLC should not change Alice's bandwidth.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// If we now send in a valid HTLC settle for the prior HTLC we added,
 	// then the bandwidth should remain unchanged as the remote party will
 	// gain additional channel balance.
-	err = bobChannel.SettleHTLC(*invoice.Terms.PaymentPreimage, bobIndex, nil, nil, nil)
+	err = harness.bobChannel.SettleHTLC(
+		*invoice.Terms.PaymentPreimage, bobIndex, nil, nil, nil,
+	)
 	require.NoError(t, err, "unable to settle htlc")
 	htlcSettle := &lnwire.UpdateFulfillHTLC{
 		ID:              0,
 		PaymentPreimage: *invoice.Terms.PaymentPreimage,
 	}
-	aliceLink.HandleChannelUpdate(htlcSettle)
+	harness.aliceLink.HandleChannelUpdate(htlcSettle)
 	time.Sleep(time.Millisecond * 500)
 
 	// Since the settle is not locked in yet, Alice's bandwidth should still
-	// reflect that she has to pay the fee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	// reflect that she has to account for the fee buffer.
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// Lock in the settle.
-	if err := updateState(tmr, coreLink, bobChannel, false); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, false,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
-	// Now that it is settled, Alice should have gotten the htlc fee back.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt)
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
+	// Now that it is settled, Alice fee buffer should have been decreased.
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// Next, we'll add another HTLC initiated by the switch (of the same
 	// amount as the prior one).
@@ -2347,17 +2598,26 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	}
 
 	circuit = makePaymentCircuit(&htlc.PaymentHash, &addPkt)
-	_, err = coreLink.cfg.Switch.commitCircuits(&circuit)
+	_, err = harness.aliceSwitch.commitCircuits(&circuit)
 	require.NoError(t, err, "unable to commit circuit")
 
 	addPkt.circuit = &circuit
-	if err := aliceLink.handleSwitchPacket(&addPkt); err != nil {
+	if err := harness.aliceLink.handleSwitchPacket(&addPkt); err != nil {
 		t.Fatalf("unable to handle switch packet: %v", err)
 	}
 	time.Sleep(time.Millisecond * 500)
 
-	// Again, Alice's bandwidth decreases by htlcAmt+htlcFee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-2*htlcAmt-htlcFee)
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(2) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
+	// Again, Alice's bandwidth decreases by htlcAmt and fee buffer.
+	assertLinkBandwidth(
+		t, harness.aliceLink, chanAmtMSat-feeBuffer-2*htlcAmt,
+	)
 
 	// Alice will send the HTLC to Bob.
 	select {
@@ -2371,15 +2631,19 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 		t.Fatalf("expected UpdateAddHTLC, got %T", msg)
 	}
 
-	bobIndex, err = bobChannel.ReceiveHTLC(addHtlc)
+	bobIndex, err = harness.bobChannel.ReceiveHTLC(addHtlc)
 	require.NoError(t, err, "bob failed receiving htlc")
 
 	// Lock in the HTLC, which should not affect the bandwidth.
-	if err := updateState(tmr, coreLink, bobChannel, true); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, true,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt*2-htlcFee)
+	assertLinkBandwidth(
+		t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt*2,
+	)
 
 	// With that processed, we'll now generate an HTLC fail (sent by the
 	// remote peer) to cancel the HTLC we just added. This should return us
@@ -2387,26 +2651,37 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	reason := make([]byte, 292)
 	copy(reason, []byte("nop"))
 
-	err = bobChannel.FailHTLC(bobIndex, reason, nil, nil, nil)
+	err = harness.bobChannel.FailHTLC(bobIndex, reason, nil, nil, nil)
 	require.NoError(t, err, "unable to fail htlc")
 	failMsg := &lnwire.UpdateFailHTLC{
 		ID:     1,
 		Reason: lnwire.OpaqueReason(reason),
 	}
 
-	aliceLink.HandleChannelUpdate(failMsg)
+	harness.aliceLink.HandleChannelUpdate(failMsg)
 	time.Sleep(time.Millisecond * 500)
 
 	// Before the Fail gets locked in, the bandwidth should remain unchanged.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt*2-htlcFee)
+	assertLinkBandwidth(
+		t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt*2,
+	)
 
 	// Lock in the Fail.
-	if err := updateState(tmr, coreLink, bobChannel, false); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, false,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// Now the bandwidth should reflect the failed HTLC.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// Moving along, we'll now receive a new HTLC from the remote peer,
 	// with an ID of 0 as this is their first HTLC. The bandwidth should
@@ -2430,31 +2705,41 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	require.NoError(t, err, "unable to add invoice to registry")
 
 	htlc.ID = 0
-	_, err = bobChannel.AddHTLC(htlc, nil)
+	_, err = harness.bobChannel.AddHTLC(htlc, nil)
 	require.NoError(t, err, "unable to add htlc")
-	aliceLink.HandleChannelUpdate(htlc)
+	harness.aliceLink.HandleChannelUpdate(htlc)
 
 	// Alice's balance remains unchanged until this HTLC is locked in.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 
 	// Lock in the HTLC.
-	if err := updateState(tmr, coreLink, bobChannel, false); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, false,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
-	// Since Bob is adding this HTLC, Alice only needs to pay the fee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(2) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
+	// Since Bob is adding this HTLC, Alice will only have an increased fee
+	// buffer.
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer-htlcAmt)
 	time.Sleep(time.Millisecond * 500)
 
 	addPkt = htlcPacket{
 		htlc:           htlc,
-		incomingChanID: aliceLink.ShortChanID(),
+		incomingChanID: harness.aliceLink.ShortChanID(),
 		incomingHTLCID: 0,
 		obfuscator:     NewMockObfuscator(),
 	}
 
 	circuit = makePaymentCircuit(&htlc.PaymentHash, &addPkt)
-	_, err = coreLink.cfg.Switch.commitCircuits(&circuit)
+	_, err = harness.aliceSwitch.commitCircuits(&circuit)
 	require.NoError(t, err, "unable to commit circuit")
 
 	addPkt.outgoingChanID = carolChanID
@@ -2467,7 +2752,7 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	// we eventually learn (simulating a multi-hop payment). The bandwidth
 	// of the channel should now be re-balanced to the starting point.
 	settlePkt := htlcPacket{
-		incomingChanID: aliceLink.ShortChanID(),
+		incomingChanID: harness.aliceLink.ShortChanID(),
 		incomingHTLCID: 0,
 		circuit:        &circuit,
 		outgoingChanID: addPkt.outgoingChanID,
@@ -2479,13 +2764,20 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 		obfuscator: NewMockObfuscator(),
 	}
 
-	if err := aliceLink.handleSwitchPacket(&settlePkt); err != nil {
+	if err := harness.aliceLink.handleSwitchPacket(&settlePkt); err != nil {
 		t.Fatalf("unable to handle switch packet: %v", err)
 	}
 	time.Sleep(time.Millisecond * 500)
 
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// Settling this HTLC gives Alice all her original bandwidth back.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer)
 
 	select {
 	case msg = <-aliceMsgs:
@@ -2497,12 +2789,14 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected UpdateFulfillHTLC, got %T", msg)
 	}
-	err = bobChannel.ReceiveHTLCSettle(settleMsg.PaymentPreimage, settleMsg.ID)
+	err = harness.bobChannel.ReceiveHTLCSettle(
+		settleMsg.PaymentPreimage, settleMsg.ID,
+	)
 	require.NoError(t, err, "failed receiving fail htlc")
 
 	// After failing an HTLC, the link will automatically trigger
 	// a state update.
-	if err := handleStateUpdate(coreLink, bobChannel); err != nil {
+	if err := handleStateUpdate(coreLink, harness.bobChannel); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
@@ -2526,29 +2820,38 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	// HTLC we add, hence it should have an ID of 1 (Alice's channel
 	// link will set this automatically for her side).
 	htlc.ID = 1
-	_, err = bobChannel.AddHTLC(htlc, nil)
+	_, err = harness.bobChannel.AddHTLC(htlc, nil)
 	require.NoError(t, err, "unable to add htlc")
-	aliceLink.HandleChannelUpdate(htlc)
+	harness.aliceLink.HandleChannelUpdate(htlc)
 	time.Sleep(time.Millisecond * 500)
 
 	// No changes before the HTLC is locked in.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth)
-	if err := updateState(tmr, coreLink, bobChannel, false); err != nil {
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer)
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, false,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
-	// After lock-in, Alice will have to pay the htlc fee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcFee)
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(2) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
+	// After lock-in, Alice will have to account for a fee buffer.
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer)
 
 	addPkt = htlcPacket{
 		htlc:           htlc,
-		incomingChanID: aliceLink.ShortChanID(),
+		incomingChanID: harness.aliceLink.ShortChanID(),
 		incomingHTLCID: 1,
 		obfuscator:     NewMockObfuscator(),
 	}
 
 	circuit = makePaymentCircuit(&htlc.PaymentHash, &addPkt)
-	_, err = coreLink.cfg.Switch.commitCircuits(&circuit)
+	_, err = harness.aliceSwitch.commitCircuits(&circuit)
 	require.NoError(t, err, "unable to commit circuit")
 
 	addPkt.outgoingChanID = carolChanID
@@ -2558,7 +2861,7 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	require.NoError(t, err, "unable to set keystone")
 
 	failPkt := htlcPacket{
-		incomingChanID: aliceLink.ShortChanID(),
+		incomingChanID: harness.aliceLink.ShortChanID(),
 		incomingHTLCID: 1,
 		circuit:        &circuit,
 		outgoingChanID: addPkt.outgoingChanID,
@@ -2570,13 +2873,20 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 		obfuscator: NewMockObfuscator(),
 	}
 
-	if err := aliceLink.handleSwitchPacket(&failPkt); err != nil {
+	if err := harness.aliceLink.handleSwitchPacket(&failPkt); err != nil {
 		t.Fatalf("unable to handle switch packet: %v", err)
 	}
 	time.Sleep(time.Millisecond * 500)
 
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// Alice should get all her bandwidth back.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer)
 
 	// Message should be sent to Bob.
 	select {
@@ -2588,15 +2898,15 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected UpdateFailHTLC, got %T", msg)
 	}
-	err = bobChannel.ReceiveFailHTLC(failMsg.ID, []byte("fail"))
+	err = harness.bobChannel.ReceiveFailHTLC(failMsg.ID, []byte("fail"))
 	require.NoError(t, err, "failed receiving fail htlc")
 
 	// After failing an HTLC, the link will automatically trigger
 	// a state update.
-	if err := handleStateUpdate(coreLink, bobChannel); err != nil {
+	if err := handleStateUpdate(coreLink, harness.bobChannel); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth)
+	assertLinkBandwidth(t, harness.aliceLink, chanAmtMSat-feeBuffer)
 }
 
 // genAddsAndCircuits creates `numHtlcs` sequential ADD packets and there
@@ -2636,19 +2946,26 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 		halfHtlcs = numHtlcs / 2
 	)
 
+	var (
+		chanAmtMSat  = lnwire.NewMSatFromSatoshis(chanAmt)
+		cType        = channeldb.SingleFunderTweaklessBit
+		commitWeight = lnwallet.CommitWeight(cType)
+	)
+
 	// We'll start by creating a new link with our chanAmt (5 BTC). We will
 	// only be testing Alice's behavior, so the reference to Bob's channel
 	// state is unnecessary.
-	aliceLink, _, batchTicker, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, batchTicker, restore,
+		t, harness.aliceSwitch, harness.aliceLink,
+		harness.aliceBatchTicker, harness.aliceRestore,
 	)
 
 	// Compute the static fees that will be used to determine the
@@ -2657,22 +2974,18 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	require.NoError(t, err, "unable to query fee estimator")
 
-	defaultCommitFee := alice.channel.StateSnapshot().CommitFee
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(input.HTLCWeight),
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight := lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer := lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
-	// that we created the channel between her and Bob, minus the commitment
-	// fee and fee of adding an HTLC.
-	expectedBandwidth := lnwire.NewMSatFromSatoshis(
-		chanAmt-defaultCommitFee,
-	) - htlcFee
+	// that we created the channel between her and Bob, minus the fee
+	// buffer.
+	expectedBandwidth := chanAmtMSat - feeBuffer
 	assertLinkBandwidth(t, alice.link, expectedBandwidth)
-
-	// Capture Alice's starting bandwidth to perform later, relative
-	// bandwidth assertions.
-	aliceStartingBandwidth := alice.link.Bandwidth()
 
 	// Next, we'll create an HTLC worth 1 BTC that will be used as a dummy
 	// message for the test.
@@ -2707,10 +3020,17 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 	// Wait until Alice's link has sent both HTLCs via the peer.
 	alice.checkSent(addPkts[:halfHtlcs])
 
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight = lntypes.WeightUnit(1+halfHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// The resulting bandwidth should reflect that Alice is paying both
-	// htlc amounts, in addition to both htlc fees.
+	// htlc amounts, in addition to the new fee buffer.
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	// Now, initiate a state transition by Alice so that the pending HTLCs
@@ -2740,9 +3060,9 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 
 	// The resulting bandwidth should remain unchanged from before,
 	// reflecting that Alice is paying both htlc amounts, in addition to
-	// both htlc fees.
+	// the fee buffer.
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	// Now, restart Alice's link *and* the entire switch. This will ensure
@@ -2793,8 +3113,12 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 	// With two HTLCs on the pending commit, and two added to the in-memory
 	// commitment state, the resulting bandwidth should reflect that Alice
 	// is paying the all htlc amounts in addition to all htlc fees.
+	htlcWeight = lntypes.WeightUnit(1+numHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-numHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-numHtlcs*(htlcAmt),
 	)
 
 	// We will try to initiate a state transition for Alice, which will
@@ -2834,7 +3158,7 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 	// reflect that Alice is paying the all htlc amounts in addition to all
 	// htlc fees.
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-numHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-numHtlcs*(htlcAmt),
 	)
 
 	// Again, we will try to initiate a state transition for Alice, which
@@ -2881,8 +3205,12 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 	// Since the latter two HTLCs have been completely dropped from memory,
 	// only the first two HTLCs we added should still be reflected in the
 	// channel bandwidth.
+	htlcWeight = lntypes.WeightUnit(1+halfHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 }
 
@@ -2901,19 +3229,26 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 		halfHtlcs = numHtlcs / 2
 	)
 
+	var (
+		chanAmtMSat  = lnwire.NewMSatFromSatoshis(chanAmt)
+		cType        = channeldb.SingleFunderTweaklessBit
+		commitWeight = lnwallet.CommitWeight(cType)
+	)
+
 	// We'll start by creating a new link with our chanAmt (5 BTC). We will
 	// only be testing Alice's behavior, so the reference to Bob's channel
 	// state is unnecessary.
-	aliceLink, _, batchTicker, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, batchTicker, restore,
+		t, harness.aliceSwitch, harness.aliceLink,
+		harness.aliceBatchTicker, harness.aliceRestore,
 	)
 
 	// We'll put Alice into hodl.Commit mode, such that the circuits for any
@@ -2927,22 +3262,18 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	require.NoError(t, err, "unable to query fee estimator")
 
-	defaultCommitFee := alice.channel.StateSnapshot().CommitFee
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(input.HTLCWeight),
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight := lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer := lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
-	// that we created the channel between her and Bob, minus the commitment
-	// fee and fee for adding an additional HTLC.
-	expectedBandwidth := lnwire.NewMSatFromSatoshis(
-		chanAmt-defaultCommitFee,
-	) - htlcFee
+	// that we created the channel between her and Bob, minus the fee
+	// buffer.
+	expectedBandwidth := chanAmtMSat - feeBuffer
 	assertLinkBandwidth(t, alice.link, expectedBandwidth)
-
-	// Capture Alice's starting bandwidth to perform later, relative
-	// bandwidth assertions.
-	aliceStartingBandwidth := alice.link.Bandwidth()
 
 	// Next, we'll create an HTLC worth 1 BTC that will be used as a dummy
 	// message for the test.
@@ -2976,10 +3307,17 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	// Wait until Alice's link has sent both HTLCs via the peer.
 	alice.checkSent(addPkts[:halfHtlcs])
 
+	// We account for the 2 htlcs and the additional one which would be
+	// needed when sending and htlc.
+	htlcWeight = lntypes.WeightUnit(1+halfHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// The resulting bandwidth should reflect that Alice is paying both
 	// htlc amounts, in addition to both htlc fees.
-	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+	assertLinkBandwidth(
+		t, alice.link, chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	alice.assertNumPendingNumOpenCircuits(2, 0)
@@ -3012,9 +3350,10 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	alice.checkSent(addPkts[:halfHtlcs])
 
 	// The resulting bandwidth should reflect that Alice is paying both htlc
-	// amounts, in addition to both htlc fees.
-	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+	// amounts, in addition to both htlc fees. The fee buffer remains the
+	// same as before.
+	assertLinkBandwidth(
+		t, alice.link, chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	// Again, initiate another state transition by Alice to try and commit
@@ -3023,7 +3362,7 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	alice.trySignNextCommitment()
 	alice.assertNumPendingNumOpenCircuits(2, 2)
 
-	// Now, we we will do a full restart of the link and switch, configuring
+	// Now, we will do a full restart of the link and switch, configuring
 	// Alice again in hodl.Commit mode. Since none of the HTLCs were
 	// actually committed, the previously opened circuits should be trimmed
 	// by both the link and switch.
@@ -3048,7 +3387,12 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	}
 
 	// Alice's bandwidth should have reverted back to her starting value.
-	assertLinkBandwidth(t, alice.link, aliceStartingBandwidth)
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
+	assertLinkBandwidth(t, alice.link, chanAmtMSat-feeBuffer)
 
 	// Now, try to commit the last two payment circuits, which are unused
 	// thus far. These should succeed without hesitation.
@@ -3068,10 +3412,17 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 	// peer.
 	alice.checkSent(addPkts[halfHtlcs:])
 
+	// We account for the 2 htlcs and the additional one which would be
+	// needed when sending and htlc.
+	htlcWeight = lntypes.WeightUnit(1+halfHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// The resulting bandwidth should reflect that Alice is paying both htlc
 	// amounts, in addition to both htlc fees.
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	// Now, initiate a state transition for Alice. Since we are hodl.Commit
@@ -3109,7 +3460,7 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 
 	// Her bandwidth should now reflect having sent only those two HTLCs.
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-halfHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-halfHtlcs*(htlcAmt),
 	)
 
 	// Now, initiate a state transition for Alice. Since we are hodl.Commit
@@ -3141,8 +3492,13 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 		t.Fatalf("expected %d packet to be failed", halfHtlcs)
 	}
 
+	htlcWeight = lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	// Alice balance should not have changed since the start.
-	assertLinkBandwidth(t, alice.link, aliceStartingBandwidth)
+	assertLinkBandwidth(t, alice.link, chanAmtMSat-feeBuffer)
 }
 
 // TestChannelLinkTrimCircuitsRemoteCommit checks that the switch and link
@@ -3156,17 +3512,24 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 		numHtlcs = 2
 	)
 
+	var (
+		chanAmtMSat  = lnwire.NewMSatFromSatoshis(chanAmt)
+		cType        = channeldb.SingleFunderTweaklessBit
+		commitWeight = lnwallet.CommitWeight(cType)
+	)
+
 	// We'll start by creating a new link with our chanAmt (5 BTC).
-	aliceLink, bobChan, batchTicker, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, batchTicker, restore,
+		t, harness.aliceSwitch, harness.aliceLink,
+		harness.aliceBatchTicker, harness.aliceRestore,
 	)
 
 	// Compute the static fees that will be used to determine the
@@ -3175,22 +3538,19 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	require.NoError(t, err, "unable to query fee estimator")
 
-	defaultCommitFee := alice.channel.StateSnapshot().CommitFee
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(input.HTLCWeight),
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight := lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer := lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
 	)
 
-	// The starting bandwidth of the channel should be exactly the amount
-	// that we created the channel between her and Bob, minus the commitment
-	// fee and fee of adding an HTLC.
-	expectedBandwidth := lnwire.NewMSatFromSatoshis(
-		chanAmt-defaultCommitFee,
-	) - htlcFee
-	assertLinkBandwidth(t, alice.link, expectedBandwidth)
+	expectedBandwidth := chanAmtMSat - feeBuffer
 
-	// Capture Alice's starting bandwidth to perform later, relative
-	// bandwidth assertions.
-	aliceStartingBandwidth := alice.link.Bandwidth()
+	// The starting bandwidth of the channel should be exactly the amount
+	// that we created the channel between her and Bob, minus the fee
+	// buffer.
+	assertLinkBandwidth(t, alice.link, expectedBandwidth)
 
 	// Next, we'll create an HTLC worth 1 BTC that will be used as a dummy
 	// message for the test.
@@ -3234,7 +3594,7 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 
 		pkt.ID = uint64(i)
 
-		_, err := bobChan.ReceiveHTLC(pkt)
+		_, err := harness.bobChannel.ReceiveHTLC(pkt)
 		if err != nil {
 			t.Fatalf("unable to receive htlc: %v", err)
 		}
@@ -3242,8 +3602,13 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 
 	// The resulting bandwidth should reflect that Alice is paying both
 	// htlc amounts, in addition to both htlc fees.
+	htlcWeight = lntypes.WeightUnit(1+numHtlcs) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+
 	assertLinkBandwidth(t, alice.link,
-		aliceStartingBandwidth-numHtlcs*(htlcAmt+htlcFee),
+		chanAmtMSat-feeBuffer-numHtlcs*(htlcAmt),
 	)
 
 	// Now, initiate a state transition by Alice so that the pending HTLCs
@@ -3259,10 +3624,12 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 			t.Fatalf("alice did not send commitment signature")
 		}
 
-		err := bobChan.ReceiveNewCommitment(&lnwallet.CommitSigs{
-			CommitSig: sig.CommitSig,
-			HtlcSigs:  sig.HtlcSigs,
-		})
+		err := harness.bobChannel.ReceiveNewCommitment(
+			&lnwallet.CommitSigs{
+				CommitSig: sig.CommitSig,
+				HtlcSigs:  sig.HtlcSigs,
+			},
+		)
 		if err != nil {
 			t.Fatalf("unable to receive new commitment: %v", err)
 		}
@@ -3271,7 +3638,7 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 
 	// Next, revoke Bob's current commitment and send it to Alice so that we
 	// can test that Alice's circuits aren't trimmed.
-	rev, _, _, err := bobChan.RevokeCurrentCommitment()
+	rev, _, _, err := harness.bobChannel.RevokeCurrentCommitment()
 	require.NoError(t, err, "unable to revoke current commitment")
 
 	_, _, _, _, err = alice.channel.ReceiveRevocation(rev)
@@ -3300,36 +3667,47 @@ func TestChannelLinkBandwidthChanReserve(t *testing.T) {
 	// channel reserve.
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTimer, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		mockBlob               [lnwire.OnionPacketSize]byte
-		coreLink               = aliceLink.(*channelLink)
-		coreChan               = coreLink.channel
-		defaultCommitFee       = coreChan.StateSnapshot().CommitFee
-		aliceStartingBandwidth = aliceLink.Bandwidth()
-		aliceMsgs              = coreLink.cfg.Peer.(*mockPeer).sentMsgs
+		mockBlob        [lnwire.OnionPacketSize]byte
+		coreLink        *channelLink
+		aliceMsgs       chan lnwire.Message
+		chanAmtMSat     = lnwire.NewMSatFromSatoshis(chanAmt)
+		chanReserveMSat = lnwire.NewMSatFromSatoshis(chanReserve)
+		cType           = channeldb.SingleFunderTweaklessBit
+		commitWeight    = lnwallet.CommitWeight(cType)
 	)
+
+	link, ok := harness.aliceLink.(*channelLink)
+	require.True(t, ok)
+	coreLink = link
+	mockedPeer := coreLink.cfg.Peer
+
+	peer, ok := mockedPeer.(*mockPeer)
+	require.True(t, ok)
+	aliceMsgs = peer.sentMsgs
 
 	estimator := chainfee.NewStaticEstimator(6000, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	require.NoError(t, err, "unable to query fee estimator")
-	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(input.HTLCWeight),
-	)
+
+	// Calculate the fee buffer for a channel state. Account for htlcs on
+	// the potential channel state as well.
+	htlcWeight := lntypes.WeightUnit(1) * input.HTLCWeight
+	feeBuffer := lnwallet.CalcFeeBuffer(feePerKw, commitWeight+htlcWeight)
 
 	// The starting bandwidth of the channel should be exactly the amount
 	// that we created the channel between her and Bob, minus the channel
-	// reserve, commitment fee and fee for adding an additional HTLC.
-	expectedBandwidth := lnwire.NewMSatFromSatoshis(
-		chanAmt-defaultCommitFee-chanReserve) - htlcFee
-	assertLinkBandwidth(t, aliceLink, expectedBandwidth)
+	// reserve and the fee buffer.
+	expectedBandwidth := chanAmtMSat - feeBuffer - chanReserveMSat
+	assertLinkBandwidth(t, harness.aliceLink, expectedBandwidth)
 
 	// Next, we'll create an HTLC worth 3 BTC, and send it into the link as
 	// a switch initiated payment.  The resulting bandwidth should
@@ -3343,12 +3721,20 @@ func TestChannelLinkBandwidthChanReserve(t *testing.T) {
 		obfuscator: NewMockObfuscator(),
 	}
 	circuit := makePaymentCircuit(&htlc.PaymentHash, addPkt)
-	_, err = coreLink.cfg.Switch.commitCircuits(&circuit)
+	_, err = harness.aliceSwitch.commitCircuits(&circuit)
 	require.NoError(t, err, "unable to commit circuit")
 
-	_ = aliceLink.handleSwitchPacket(addPkt)
+	_ = harness.aliceLink.handleSwitchPacket(addPkt)
 	time.Sleep(time.Millisecond * 100)
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+
+	htlcWeight = lntypes.WeightUnit(2) * input.HTLCWeight
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+htlcWeight,
+	)
+	assertLinkBandwidth(
+		t, harness.aliceLink,
+		chanAmtMSat-htlcAmt-feeBuffer-chanReserveMSat,
+	)
 
 	// Alice should send the HTLC to Bob.
 	var msg lnwire.Message
@@ -3363,39 +3749,58 @@ func TestChannelLinkBandwidthChanReserve(t *testing.T) {
 		t.Fatalf("expected UpdateAddHTLC, got %T", msg)
 	}
 
-	bobIndex, err := bobChannel.ReceiveHTLC(addHtlc)
+	bobIndex, err := harness.bobChannel.ReceiveHTLC(addHtlc)
 	require.NoError(t, err, "bob failed receiving htlc")
 
 	// Lock in the HTLC.
-	if err := updateState(batchTimer, coreLink, bobChannel, true); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, true,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	assertLinkBandwidth(
+		t, harness.aliceLink,
+		chanAmtMSat-htlcAmt-feeBuffer-chanReserveMSat,
+	)
 
 	// If we now send in a valid HTLC settle for the prior HTLC we added,
 	// then the bandwidth should remain unchanged as the remote party will
 	// gain additional channel balance.
-	err = bobChannel.SettleHTLC(*invoice.Terms.PaymentPreimage, bobIndex, nil, nil, nil)
+	err = harness.bobChannel.SettleHTLC(
+		*invoice.Terms.PaymentPreimage, bobIndex, nil, nil, nil,
+	)
 	require.NoError(t, err, "unable to settle htlc")
 	htlcSettle := &lnwire.UpdateFulfillHTLC{
 		ID:              bobIndex,
 		PaymentPreimage: *invoice.Terms.PaymentPreimage,
 	}
-	aliceLink.HandleChannelUpdate(htlcSettle)
+	harness.aliceLink.HandleChannelUpdate(htlcSettle)
 	time.Sleep(time.Millisecond * 500)
 
 	// Since the settle is not locked in yet, Alice's bandwidth should still
 	// reflect that she has to pay the fee.
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt-htlcFee)
+	assertLinkBandwidth(
+		t, harness.aliceLink,
+		chanAmtMSat-htlcAmt-feeBuffer-chanReserveMSat,
+	)
 
 	// Lock in the settle.
-	if err := updateState(batchTimer, coreLink, bobChannel, false); err != nil {
+	if err := updateState(
+		harness.aliceBatchTicker, coreLink, harness.bobChannel, false,
+	); err != nil {
 		t.Fatalf("unable to update state: %v", err)
 	}
 
+	feeBuffer = lnwallet.CalcFeeBuffer(
+		feePerKw, commitWeight+input.HTLCWeight,
+	)
+
 	time.Sleep(time.Millisecond * 100)
-	assertLinkBandwidth(t, aliceLink, aliceStartingBandwidth-htlcAmt)
+	assertLinkBandwidth(
+		t, harness.aliceLink,
+		chanAmtMSat-htlcAmt-feeBuffer-chanReserveMSat,
+	)
 
 	// Now we create a channel that has a channel reserve that is
 	// greater than it's balance. In these case only payments can
@@ -3403,16 +3808,15 @@ func TestChannelLinkBandwidthChanReserve(t *testing.T) {
 	// should therefore be 0.
 	const bobChanAmt = btcutil.SatoshiPerBitcoin * 1
 	const bobChanReserve = btcutil.SatoshiPerBitcoin * 1.5
-	bobLink, _, _, start, _, err :=
-		newSingleLinkTestHarness(t, bobChanAmt, bobChanReserve)
+	harness, err = newSingleLinkTestHarness(t, bobChanAmt, bobChanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	// Make sure bandwidth is reported as 0.
-	assertLinkBandwidth(t, bobLink, 0)
+	assertLinkBandwidth(t, harness.aliceLink, 0)
 }
 
 // TestChannelRetransmission tests the ability of the channel links to
@@ -3558,7 +3962,8 @@ func TestChannelRetransmission(t *testing.T) {
 			t.Fatalf("unable to create channel: %v", err)
 		}
 
-		chanID := lnwire.NewChanIDFromOutPoint(channels.aliceToBob.ChannelPoint())
+		chanPoint := channels.aliceToBob.ChannelPoint()
+		chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
 		serverErr := make(chan error, 4)
 
 		aliceInterceptor := createInterceptorFunc("[alice] <-- [bob]",
@@ -3840,7 +4245,7 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	// Define a helper method that strobes the switch's log ticker, and
 	// unblocks after nothing has been pulled for two seconds.
 	waitForBobsSwitchToBlock := func() {
-		bobSwitch := n.firstBobChannelLink.cfg.Switch
+		bobSwitch := n.bobServer.htlcSwitch
 		ticker := bobSwitch.cfg.LogEventTicker.(*ticker.Force)
 		timeout := time.After(15 * time.Second)
 		for {
@@ -3890,7 +4295,7 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	// first acquiring the index mutex and forcing a log event so that the
 	// htlcForwarder is blocked inside the logTicker case, which also needs
 	// the indexMtx.
-	n.firstBobChannelLink.cfg.Switch.indexMtx.Lock()
+	n.bobServer.htlcSwitch.indexMtx.Lock()
 
 	// Strobe the log ticker, and wait for switch to stop accepting any more
 	// log ticks.
@@ -3900,8 +4305,8 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	// channel, and unlock the indexMtx to allow return to the
 	// htlcForwarder's main select. After this, any attempt to forward
 	// through the switch will block.
-	n.firstBobChannelLink.cfg.Switch.htlcPlex = nil
-	n.firstBobChannelLink.cfg.Switch.indexMtx.Unlock()
+	n.bobServer.htlcSwitch.htlcPlex = nil
+	n.bobServer.htlcSwitch.indexMtx.Unlock()
 
 	// Now, make a payment from Alice to Carol, which should cause Bob's
 	// incoming link to block when it tries to submit the packet to the nil
@@ -4066,9 +4471,19 @@ func TestChannelLinkUpdateCommitFee(t *testing.T) {
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that exceeds its maximum fee allocation should result in a fee rate
-	// corresponding to the maximum fee allocation.
+	// corresponding to the maximum fee allocation. Increase the dust
+	// threshold so that we don't trigger that logic.
+	highFeeExposure := lnwire.NewMSatFromSatoshis(
+		2 * btcutil.SatoshiPerBitcoin,
+	)
 	const maxFeeRate chainfee.SatPerKWeight = 207180182
+	n.aliceChannelLink.cfg.MaxFeeExposure = highFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = highFeeExposure
 	triggerFeeUpdate(maxFeeRate+1, minRelayFee, maxFeeRate, true)
+
+	// Decrease the max fee exposure back to normal.
+	n.aliceChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that is below the current min relay fee rate should result in a fee
@@ -4252,6 +4667,7 @@ func TestChannelLinkAcceptOverpay(t *testing.T) {
 type persistentLinkHarness struct {
 	t *testing.T
 
+	hSwitch  *Switch
 	link     ChannelLink
 	coreLink *channelLink
 	channel  *lnwallet.LightningChannel
@@ -4264,7 +4680,7 @@ type persistentLinkHarness struct {
 
 // newPersistentLinkHarness initializes a new persistentLinkHarness and derives
 // the supporting references from the active link.
-func newPersistentLinkHarness(t *testing.T, link ChannelLink,
+func newPersistentLinkHarness(t *testing.T, hSwitch *Switch, link ChannelLink,
 	batchTicker chan time.Time,
 	restore func() (*lnwallet.LightningChannel,
 		error)) *persistentLinkHarness {
@@ -4273,6 +4689,7 @@ func newPersistentLinkHarness(t *testing.T, link ChannelLink,
 
 	return &persistentLinkHarness{
 		t:           t,
+		hSwitch:     hSwitch,
 		link:        link,
 		coreLink:    coreLink,
 		channel:     coreLink.channel,
@@ -4296,12 +4713,15 @@ func (h *persistentLinkHarness) restart(restartSwitch, syncStates bool,
 	hodlFlags ...hodl.Flag) {
 
 	// First, remove the link from the switch.
-	h.coreLink.cfg.Switch.RemoveLink(h.link.ChanID())
+	h.hSwitch.RemoveLink(h.link.ChanID())
 
 	if restartSwitch {
 		// If a switch restart is requested, we will stop it. It will be
 		// reinstantiated in restartLink.
-		h.coreLink.cfg.Switch.Stop()
+		err := h.hSwitch.Stop()
+		if err != nil {
+			h.t.Fatalf("unable to stop switch: %v", err)
+		}
 	}
 
 	// Since our in-memory state may have diverged from our persistent
@@ -4350,7 +4770,7 @@ func (h *persistentLinkHarness) checkSent(pkts []*htlcPacket) {
 // switch's circuit map. The forwarding actions are returned if there was no
 // failure.
 func (h *persistentLinkHarness) commitCircuits(circuits []*PaymentCircuit) *CircuitFwdActions {
-	fwdActions, err := h.coreLink.cfg.Switch.commitCircuits(circuits...)
+	fwdActions, err := h.hSwitch.commitCircuits(circuits...)
 	if err != nil {
 		h.t.Fatalf("unable to commit circuit: %v", err)
 	}
@@ -4363,12 +4783,12 @@ func (h *persistentLinkHarness) assertNumPendingNumOpenCircuits(
 
 	_, _, line, _ := runtime.Caller(1)
 
-	numPending := h.coreLink.cfg.Switch.circuits.NumPending()
+	numPending := h.hSwitch.circuits.NumPending()
 	if numPending != wantPending {
 		h.t.Fatalf("line: %d: wrong number of pending circuits: "+
 			"want %d, got %d", line, wantPending, numPending)
 	}
-	numOpen := h.coreLink.cfg.Switch.circuits.NumOpen()
+	numOpen := h.hSwitch.circuits.NumOpen()
 	if numOpen != wantOpen {
 		h.t.Fatalf("line: %d: wrong number of open circuits: "+
 			"want %d, got %d", line, wantOpen, numOpen)
@@ -4414,10 +4834,9 @@ func (h *persistentLinkHarness) restartLink(
 	)
 
 	aliceDb := aliceChannel.State().Db.GetParentDB()
-	aliceSwitch := h.coreLink.cfg.Switch
 	if restartSwitch {
 		var err error
-		aliceSwitch, err = initSwitchWithDB(testStartingHeight, aliceDb)
+		h.hSwitch, err = initSwitchWithDB(testStartingHeight, aliceDb)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -4446,11 +4865,10 @@ func (h *persistentLinkHarness) restartLink(
 	aliceCfg := ChannelLinkConfig{
 		FwrdingPolicy: globalPolicy,
 		Peer:          alicePeer,
-		Switch:        aliceSwitch,
-		BestHeight:    aliceSwitch.BestHeight,
-		Circuits:      aliceSwitch.CircuitModifier(),
+		BestHeight:    h.hSwitch.BestHeight,
+		Circuits:      h.hSwitch.CircuitModifier(),
 		ForwardPackets: func(linkQuit chan struct{}, _ bool, packets ...*htlcPacket) error {
-			return aliceSwitch.ForwardPackets(linkQuit, packets...)
+			return h.hSwitch.ForwardPackets(linkQuit, packets...)
 		},
 		DecodeHopIterators: decoder.DecodeHopIterators,
 		ExtractErrorEncrypter: func(*btcec.PublicKey) (
@@ -4473,11 +4891,11 @@ func (h *persistentLinkHarness) restartLink(
 		BatchTicker:          bticker,
 		FwdPkgGCTicker:       ticker.New(5 * time.Second),
 		PendingCommitTicker:  ticker.New(time.Minute),
-		// Make the BatchSize and Min/MaxFeeUpdateTimeout large enough
+		// Make the BatchSize and Min/MaxUpdateTimeout large enough
 		// to not trigger commit updates automatically during tests.
-		BatchSize:           10000,
-		MinFeeUpdateTimeout: 30 * time.Minute,
-		MaxFeeUpdateTimeout: 40 * time.Minute,
+		BatchSize:        10000,
+		MinUpdateTimeout: 30 * time.Minute,
+		MaxUpdateTimeout: 40 * time.Minute,
 		// Set any hodl flags requested for the new link.
 		HodlMask:                hodl.MaskFromFlags(hodlFlags...),
 		MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
@@ -4486,13 +4904,13 @@ func (h *persistentLinkHarness) restartLink(
 		NotifyActiveChannel:     func(wire.OutPoint) {},
 		NotifyInactiveChannel:   func(wire.OutPoint) {},
 		NotifyInactiveLinkEvent: func(wire.OutPoint) {},
-		HtlcNotifier:            aliceSwitch.cfg.HtlcNotifier,
+		HtlcNotifier:            h.hSwitch.cfg.HtlcNotifier,
 		SyncStates:              syncStates,
 		GetAliases:              getAliases,
 	}
 
 	aliceLink := NewChannelLink(aliceCfg, aliceChannel)
-	if err := aliceSwitch.AddLink(aliceLink); err != nil {
+	if err := h.hSwitch.AddLink(aliceLink); err != nil {
 		return nil, nil, err
 	}
 	go func() {
@@ -4569,16 +4987,17 @@ func TestChannelLinkNoMoreUpdates(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, _, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
@@ -4587,10 +5006,11 @@ func TestChannelLinkNoMoreUpdates(t *testing.T) {
 	htlc2 := generateHtlc(t, coreLink, 1)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// We now play out the following scanario:
@@ -4692,16 +5112,17 @@ func TestChannelLinkWaitForRevocation(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, _, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
@@ -4714,10 +5135,11 @@ func TestChannelLinkWaitForRevocation(t *testing.T) {
 	}
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	assertNoMsgFromAlice := func() {
@@ -4810,25 +5232,27 @@ func TestChannelLinkNoEmptySig(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
-	t.Cleanup(aliceLink.Stop)
+	t.Cleanup(harness.aliceLink.Stop)
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// Send htlc 1 from Alice to Bob.
@@ -4838,7 +5262,7 @@ func TestChannelLinkNoEmptySig(t *testing.T) {
 
 	// Tick the batch ticker to trigger a commitsig from Alice->Bob.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -4856,7 +5280,7 @@ func TestChannelLinkNoEmptySig(t *testing.T) {
 
 	// Tick the batch ticker to trigger a commitsig from Alice->Bob.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -4868,7 +5292,7 @@ func TestChannelLinkNoEmptySig(t *testing.T) {
 	ctx.sendCommitSigBobToAlice(1)
 
 	// Now send Bob the signature from Alice covering both htlcs.
-	err = bobChannel.ReceiveNewCommitment(&lnwallet.CommitSigs{
+	err = harness.bobChannel.ReceiveNewCommitment(&lnwallet.CommitSigs{
 		CommitSig: commitSigAlice.CommitSig,
 		HtlcSigs:  commitSigAlice.HtlcSigs,
 	})
@@ -4915,16 +5339,17 @@ func TestChannelLinkBatchPreimageWrite(t *testing.T) {
 func testChannelLinkBatchPreimageWrite(t *testing.T, disconnect bool) {
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, startUp, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := startUp(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
@@ -4939,10 +5364,11 @@ func testChannelLinkBatchPreimageWrite(t *testing.T, disconnect bool) {
 	}
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// First, send a batch of Adds from Alice to Bob.
@@ -4957,7 +5383,7 @@ func testChannelLinkBatchPreimageWrite(t *testing.T, disconnect bool) {
 	// Force alice's link to sign a commitment covering the htlcs sent thus
 	// far.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(15 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -4989,7 +5415,7 @@ func testChannelLinkBatchPreimageWrite(t *testing.T, disconnect bool) {
 	// CommitSig, and simply stop Alice's link. As she exits, we should
 	// detect that she has uncommitted preimages and write them to disk.
 	if disconnect {
-		aliceLink.Stop()
+		harness.aliceLink.Stop()
 		checkHasPreimages(t, coreLink, htlcs, true)
 		return
 	}
@@ -5023,16 +5449,17 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, _, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
@@ -5046,10 +5473,11 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 	htlc2 := generateHtlc(t, coreLink, 1)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// We start with he following scenario: Bob sends Alice two HTLCs, and a
@@ -5107,12 +5535,12 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 	// packet will NOT include a sourceRef, meaning the AddRef on disk will
 	// not be acked after committing this response.
 	fail0 := &htlcPacket{
-		incomingChanID: bobChannel.ShortChanID(),
+		incomingChanID: harness.bobChannel.ShortChanID(),
 		incomingHTLCID: 0,
 		obfuscator:     NewMockObfuscator(),
 		htlc:           &lnwire.UpdateFailHTLC{},
 	}
-	_ = aliceLink.handleSwitchPacket(fail0)
+	_ = harness.aliceLink.handleSwitchPacket(fail0)
 
 	//  Bob               Alice
 	//   |<----- fal-1 ------|
@@ -5165,12 +5593,12 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 			Height: addHeight,
 			Index:  1,
 		},
-		incomingChanID: bobChannel.ShortChanID(),
+		incomingChanID: harness.bobChannel.ShortChanID(),
 		incomingHTLCID: 1,
 		obfuscator:     NewMockObfuscator(),
 		htlc:           &lnwire.UpdateFailHTLC{},
 	}
-	_ = aliceLink.handleSwitchPacket(fail1)
+	_ = harness.aliceLink.handleSwitchPacket(fail1)
 
 	//  Bob               Alice
 	//   |<----- fal-1 ------|
@@ -5225,7 +5653,7 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 	// this should trigger an attempt to cleanup the spurious response.
 	// However, we expect it to result in a NOP since it is still missing
 	// its sourceRef.
-	_ = aliceLink.handleSwitchPacket(fail0)
+	_ = harness.aliceLink.handleSwitchPacket(fail0)
 
 	// Allow the link enough time to process and reject the duplicate
 	// packet, we'll also check that this doesn't trigger Alice to send the
@@ -5273,12 +5701,12 @@ func TestChannelLinkCleanupSpuriousResponses(t *testing.T) {
 			Height: addHeight,
 			Index:  0,
 		},
-		incomingChanID: bobChannel.ShortChanID(),
+		incomingChanID: harness.bobChannel.ShortChanID(),
 		incomingHTLCID: 0,
 		obfuscator:     NewMockObfuscator(),
 		htlc:           &lnwire.UpdateFailHTLC{},
 	}
-	_ = aliceLink.handleSwitchPacket(fail0)
+	_ = harness.aliceLink.handleSwitchPacket(fail0)
 
 	// Allow the link enough time to process and reject the duplicate
 	// packet, we'll also check that this doesn't trigger Alice to send the
@@ -5362,7 +5790,7 @@ func TestChannelLinkFail(t *testing.T) {
 
 		// link test is used to execute the given test on the channel
 		// link after it is started.
-		linkTest func(*testing.T, *channelLink,
+		linkTest func(*testing.T, *Switch, *channelLink,
 			*lnwallet.LightningChannel)
 
 		// shouldFail indicates whether or not the link should fail
@@ -5384,7 +5812,7 @@ func TestChannelLinkFail(t *testing.T) {
 				"message",
 			func(c *channelLink) {
 			},
-			func(_ *testing.T, c *channelLink,
+			func(_ *testing.T, _ *Switch, c *channelLink,
 				_ *lnwallet.LightningChannel) {
 
 				warningMsg := &lnwire.Warning{
@@ -5405,7 +5833,7 @@ func TestChannelLinkFail(t *testing.T) {
 				// the SendMessage call fail.
 				c.cfg.Peer.(*mockPeer).disconnected = true
 			},
-			func(*testing.T, *channelLink,
+			func(*testing.T, *Switch, *channelLink,
 				*lnwallet.LightningChannel) { //nolint:whitespace,lll
 
 				// Should fail at startup.
@@ -5425,7 +5853,7 @@ func TestChannelLinkFail(t *testing.T) {
 				}
 				c.channel.State().Packager = pkg
 			},
-			func(*testing.T, *channelLink,
+			func(*testing.T, *Switch, *channelLink,
 				*lnwallet.LightningChannel) { //nolint:whitespace,lll
 
 				// Should fail at startup.
@@ -5439,7 +5867,7 @@ func TestChannelLinkFail(t *testing.T) {
 				"invalid Settle message",
 			func(c *channelLink) {
 			},
-			func(_ *testing.T, c *channelLink,
+			func(_ *testing.T, s *Switch, c *channelLink,
 				_ *lnwallet.LightningChannel) {
 
 				// Recevive an htlc settle for an htlc that was
@@ -5459,15 +5887,16 @@ func TestChannelLinkFail(t *testing.T) {
 				"CommitSig, not containing enough HTLC sigs",
 			func(c *channelLink) {
 			},
-			func(_ *testing.T, c *channelLink,
+			func(_ *testing.T, s *Switch, c *channelLink,
 				remoteChannel *lnwallet.LightningChannel) {
 
 				// Generate an HTLC and send to the link.
 				htlc1 := generateHtlc(t, c, 0)
 				ctx := linkTestContext{
-					t:          t,
-					aliceLink:  c,
-					bobChannel: remoteChannel,
+					t:           t,
+					aliceSwitch: s,
+					aliceLink:   c,
+					bobChannel:  remoteChannel,
 				}
 				ctx.sendHtlcBobToAlice(htlc1)
 
@@ -5497,7 +5926,7 @@ func TestChannelLinkFail(t *testing.T) {
 				"CommitSig, where the sig itself is corrupted",
 			func(c *channelLink) {
 			},
-			func(t *testing.T, c *channelLink,
+			func(t *testing.T, s *Switch, c *channelLink,
 				remoteChannel *lnwallet.LightningChannel) {
 
 				t.Helper()
@@ -5505,9 +5934,10 @@ func TestChannelLinkFail(t *testing.T) {
 				// Generate an HTLC and send to the link.
 				htlc1 := generateHtlc(t, c, 0)
 				ctx := linkTestContext{
-					t:          t,
-					aliceLink:  c,
-					bobChannel: remoteChannel,
+					t:           t,
+					aliceSwitch: s,
+					aliceLink:   c,
+					bobChannel:  remoteChannel,
 				}
 
 				ctx.sendHtlcBobToAlice(htlc1)
@@ -5545,7 +5975,7 @@ func TestChannelLinkFail(t *testing.T) {
 				"error from the remote",
 			func(c *channelLink) {
 			},
-			func(_ *testing.T, c *channelLink,
+			func(_ *testing.T, _ *Switch, c *channelLink,
 				remoteChannel *lnwallet.LightningChannel) {
 
 				err := &lnwire.Error{}
@@ -5563,11 +5993,12 @@ func TestChannelLinkFail(t *testing.T) {
 
 	// Execute each test case.
 	for _, test := range testCases {
-		link, remoteChannel, _, start, _, err :=
+		harness, err :=
 			newSingleLinkTestHarness(t, chanAmt, 0)
 		require.NoError(t, err, test.name)
 
-		coreLink := link.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink := harness.aliceLink.(*channelLink)
 
 		// Set up a channel used to check whether the link error
 		// force closed the channel.
@@ -5580,11 +6011,13 @@ func TestChannelLinkFail(t *testing.T) {
 
 		// Set up the link before starting it.
 		test.options(coreLink)
-		err = start()
+		err = harness.start()
 		require.NoError(t, err, test.name)
 
 		// Execute the test case.
-		test.linkTest(t, coreLink, remoteChannel)
+		test.linkTest(
+			t, harness.aliceSwitch, coreLink, harness.bobChannel,
+		)
 
 		// Currently we expect all test cases to lead to link error.
 		var linkErr LinkFailureError
@@ -5771,7 +6204,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("satisfied", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 1500, 1000,
-			200, 150, 0, lnwire.ShortChannelID{})
+			200, 150, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if result != nil {
 			t.Fatalf("expected policy to be satisfied")
 		}
@@ -5779,7 +6214,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("below minhtlc", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 100, 50,
-			200, 150, 0, lnwire.ShortChannelID{})
+			200, 150, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailAmountBelowMinimum); !ok {
 			t.Fatalf("expected FailAmountBelowMinimum failure code")
 		}
@@ -5787,7 +6224,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("above maxhtlc", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 1500, 1200,
-			200, 150, 0, lnwire.ShortChannelID{})
+			200, 150, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailTemporaryChannelFailure); !ok {
 			t.Fatalf("expected FailTemporaryChannelFailure failure code")
 		}
@@ -5795,7 +6234,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("insufficient fee", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 1005, 1000,
-			200, 150, 0, lnwire.ShortChannelID{})
+			200, 150, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailFeeInsufficient); !ok {
 			t.Fatalf("expected FailFeeInsufficient failure code")
 		}
@@ -5808,7 +6249,7 @@ func TestCheckHtlcForward(t *testing.T) {
 
 		result := link.CheckHtlcForward(
 			hash, 100005, 100000, 200,
-			150, 0, lnwire.ShortChannelID{},
+			150, models.InboundFee{}, 0, lnwire.ShortChannelID{},
 		)
 		_, ok := result.WireMessage().(*lnwire.FailFeeInsufficient)
 		require.True(t, ok, "expected FailFeeInsufficient failure code")
@@ -5816,7 +6257,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("expiry too soon", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 1500, 1000,
-			200, 150, 190, lnwire.ShortChannelID{})
+			200, 150, models.InboundFee{}, 190,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailExpiryTooSoon); !ok {
 			t.Fatalf("expected FailExpiryTooSoon failure code")
 		}
@@ -5824,7 +6267,9 @@ func TestCheckHtlcForward(t *testing.T) {
 
 	t.Run("incorrect cltv expiry", func(t *testing.T) {
 		result := link.CheckHtlcForward(hash, 1500, 1000,
-			200, 190, 0, lnwire.ShortChannelID{})
+			200, 190, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailIncorrectCltvExpiry); !ok {
 			t.Fatalf("expected FailIncorrectCltvExpiry failure code")
 		}
@@ -5834,9 +6279,35 @@ func TestCheckHtlcForward(t *testing.T) {
 	t.Run("cltv expiry too far in the future", func(t *testing.T) {
 		// Check that expiry isn't too far in the future.
 		result := link.CheckHtlcForward(hash, 1500, 1000,
-			10200, 10100, 0, lnwire.ShortChannelID{})
+			10200, 10100, models.InboundFee{}, 0,
+			lnwire.ShortChannelID{},
+		)
 		if _, ok := result.WireMessage().(*lnwire.FailExpiryTooFar); !ok {
 			t.Fatalf("expected FailExpiryTooFar failure code")
+		}
+	})
+
+	t.Run("inbound fee satisfied", func(t *testing.T) {
+		t.Parallel()
+
+		result := link.CheckHtlcForward(hash, 1000+10-2-1, 1000,
+			200, 150, models.InboundFee{Base: -2, Rate: -1_000},
+			0, lnwire.ShortChannelID{})
+		if result != nil {
+			t.Fatalf("expected policy to be satisfied")
+		}
+	})
+
+	t.Run("inbound fee insufficient", func(t *testing.T) {
+		t.Parallel()
+
+		result := link.CheckHtlcForward(hash, 1000+10-10-101-1, 1000,
+			200, 150, models.InboundFee{Base: -10, Rate: -100_000},
+			0, lnwire.ShortChannelID{})
+
+		msg := result.WireMessage()
+		if _, ok := msg.(*lnwire.FailFeeInsufficient); !ok {
+			t.Fatalf("expected FailFeeInsufficient failure code")
 		}
 	})
 }
@@ -5847,7 +6318,7 @@ func TestChannelLinkCanceledInvoice(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -5903,7 +6374,7 @@ type hodlInvoiceTestCtx struct {
 
 func newHodlInvoiceTestCtx(t *testing.T) (*hodlInvoiceTestCtx, error) {
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -6059,15 +6530,16 @@ func TestChannelLinkHoldInvoiceRestart(t *testing.T) {
 	// We'll start by creating a new link with our chanAmt (5 BTC). We will
 	// only be testing Alice's behavior, so the reference to Bob's channel
 	// state is unnecessary.
-	aliceLink, bobChannel, _, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, nil, restore,
+		t, harness.aliceSwitch, harness.aliceLink, nil,
+		harness.aliceRestore,
 	)
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
@@ -6093,10 +6565,11 @@ func TestChannelLinkHoldInvoiceRestart(t *testing.T) {
 	require.NoError(t, err, "unable to add invoice to registry")
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  alice.link,
-		aliceMsgs:  alice.msgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   alice.link,
+		aliceMsgs:   alice.msgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// Lock in htlc paying the hodl invoice.
@@ -6112,7 +6585,7 @@ func TestChannelLinkHoldInvoiceRestart(t *testing.T) {
 
 	// Increase block height. This height will be retrieved by the link
 	// after restart.
-	coreLink.cfg.Switch.bestHeight++
+	harness.aliceSwitch.bestHeight++
 
 	// Restart link.
 	alice.restart(false, false)
@@ -6153,26 +6626,28 @@ func TestChannelLinkRevocationWindowRegular(t *testing.T) {
 	// We'll start by creating a new link with our chanAmt (5 BTC). We will
 	// only be testing Alice's behavior, so the reference to Bob's channel
 	// state is unnecessary.
-	aliceLink, bobChannel, _, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
-	t.Cleanup(aliceLink.Stop)
+	t.Cleanup(harness.aliceLink.Stop)
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		registry  = coreLink.cfg.Registry.(*mockInvoiceRegistry)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	registry.settleChan = make(chan lntypes.Hash)
@@ -6236,16 +6711,17 @@ func TestChannelLinkRevocationWindowHodl(t *testing.T) {
 	// We'll start by creating a new link with our chanAmt (5 BTC). We will
 	// only be testing Alice's behavior, so the reference to Bob's channel
 	// state is unnecessary.
-	aliceLink, bobChannel, batchTicker, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		registry  = coreLink.cfg.Registry.(*mockInvoiceRegistry)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
@@ -6274,10 +6750,11 @@ func TestChannelLinkRevocationWindowHodl(t *testing.T) {
 	require.NoError(t, err, "unable to add invoice to registry")
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// Lock in htlc 1 on both sides.
@@ -6345,7 +6822,7 @@ func TestChannelLinkRevocationWindowHodl(t *testing.T) {
 
 	// Trigger the batch timer as this may trigger Alice to send a commit
 	// sig.
-	batchTicker <- time.Time{}
+	harness.aliceBatchTicker <- time.Time{}
 
 	// After the revocation, it is again possible for Alice to send a commit
 	// sig no more htlcs. Bob acks the update.
@@ -6357,7 +6834,7 @@ func TestChannelLinkRevocationWindowHodl(t *testing.T) {
 	ctx.receiveRevAndAckAliceToBob()
 
 	// Stop the link
-	aliceLink.Stop()
+	harness.aliceLink.Stop()
 
 	// Check that no unexpected messages were sent.
 	select {
@@ -6375,24 +6852,26 @@ func TestChannelLinkReceiveEmptySig(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	htlc, _ := generateHtlcAndInvoice(t, 0)
@@ -6403,7 +6882,7 @@ func TestChannelLinkReceiveEmptySig(t *testing.T) {
 
 	// Tick the batch ticker to trigger a commitsig from Alice->Bob.
 	select {
-	case batchTicker <- time.Now():
+	case harness.aliceBatchTicker <- time.Now():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("could not force commit sig")
 	}
@@ -6432,7 +6911,7 @@ func TestChannelLinkReceiveEmptySig(t *testing.T) {
 	ctx.assertNoMsgFromAlice(time.Second)
 
 	// Stop the link
-	aliceLink.Stop()
+	harness.aliceLink.Stop()
 }
 
 // TestPendingCommitTicker tests that a link will fail itself after a timeout if
@@ -6442,12 +6921,13 @@ func TestPendingCommitTicker(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err, "unable to create link")
 
 	var (
-		coreLink  = aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		coreLink  = harness.aliceLink.(*channelLink)
 		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
 	)
 
@@ -6460,15 +6940,16 @@ func TestPendingCommitTicker(t *testing.T) {
 		linkErrs <- linkErr
 	}
 
-	if err := start(); err != nil {
+	if err := harness.start(); err != nil {
 		t.Fatalf("unable to start test harness: %v", err)
 	}
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		bobChannel: bobChannel,
-		aliceMsgs:  aliceMsgs,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		bobChannel:  harness.bobChannel,
+		aliceMsgs:   aliceMsgs,
 	}
 
 	// Send an HTLC from Alice to Bob, and signal the batch ticker to signa
@@ -6476,7 +6957,7 @@ func TestPendingCommitTicker(t *testing.T) {
 	htlc, _ := generateHtlcAndInvoice(t, 0)
 	ctx.sendHtlcAliceToBob(0, htlc)
 	ctx.receiveHtlcAliceToBob()
-	batchTicker <- time.Now()
+	harness.aliceBatchTicker <- time.Now()
 
 	select {
 	case msg := <-aliceMsgs:
@@ -6501,7 +6982,7 @@ func TestPendingCommitTicker(t *testing.T) {
 	htlc, _ = generateHtlcAndInvoice(t, 1)
 	ctx.sendHtlcAliceToBob(1, htlc)
 	ctx.receiveHtlcAliceToBob()
-	batchTicker <- time.Now()
+	harness.aliceBatchTicker <- time.Now()
 
 	// Assert that we get the expected link failure from Alice.
 	select {
@@ -6518,94 +6999,6 @@ func TestPendingCommitTicker(t *testing.T) {
 	}
 }
 
-// TestShutdownIfChannelClean tests that a link will exit the htlcManager loop
-// if and only if the underlying channel state is clean.
-func TestShutdownIfChannelClean(t *testing.T) {
-	t.Parallel()
-
-	const chanAmt = btcutil.SatoshiPerBitcoin * 5
-	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, batchTicker, start, _, err :=
-		newSingleLinkTestHarness(t, chanAmt, chanReserve)
-	require.NoError(t, err)
-
-	var (
-		coreLink  = aliceLink.(*channelLink)
-		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
-	)
-
-	shutdownAssert := func(expectedErr error) {
-		err = aliceLink.ShutdownIfChannelClean()
-		if expectedErr != nil {
-			require.Error(t, err, expectedErr)
-		} else {
-			require.NoError(t, err)
-		}
-	}
-
-	err = start()
-	require.NoError(t, err)
-
-	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		bobChannel: bobChannel,
-		aliceMsgs:  aliceMsgs,
-	}
-
-	// First send an HTLC from Bob to Alice and assert that the link can't
-	// be shutdown while the update is outstanding.
-	htlc := generateHtlc(t, coreLink, 0)
-
-	// <---add-----
-	ctx.sendHtlcBobToAlice(htlc)
-	// <---sig-----
-	ctx.sendCommitSigBobToAlice(1)
-	// ----rev---->
-	ctx.receiveRevAndAckAliceToBob()
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// ----sig---->
-	ctx.receiveCommitSigAliceToBob(1)
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// <---rev-----
-	ctx.sendRevAndAckBobToAlice()
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// ---settle-->
-	ctx.receiveSettleAliceToBob()
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// ----sig---->
-	ctx.receiveCommitSigAliceToBob(0)
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// <---rev-----
-	ctx.sendRevAndAckBobToAlice()
-	shutdownAssert(ErrLinkFailedShutdown)
-
-	// There is currently no controllable breakpoint between Alice
-	// receiving the CommitSig and her sending out the RevokeAndAck. As
-	// soon as the RevokeAndAck is generated, the channel becomes clean.
-	// This can happen right after the CommitSig is received, so there is
-	// no shutdown assertion here.
-	// <---sig-----
-	ctx.sendCommitSigBobToAlice(0)
-
-	// ----rev---->
-	ctx.receiveRevAndAckAliceToBob()
-	shutdownAssert(nil)
-
-	// Now that the link has exited the htlcManager loop, attempt to
-	// trigger the batch ticker. It should not be possible.
-	select {
-	case batchTicker <- time.Now():
-		t.Fatalf("expected batch ticker to be inactive")
-	case <-time.After(5 * time.Second):
-	}
-}
-
 // TestPipelineSettle tests that a link should only pipeline a settle if the
 // related add is fully locked-in meaning it is on both sides' commitment txns.
 func TestPipelineSettle(t *testing.T) {
@@ -6613,12 +7006,13 @@ func TestPipelineSettle(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 	const chanReserve = btcutil.SatoshiPerBitcoin * 1
-	aliceLink, bobChannel, _, start, restore, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, chanReserve)
 	require.NoError(t, err)
 
 	alice := newPersistentLinkHarness(
-		t, aliceLink, nil, restore,
+		t, harness.aliceSwitch, harness.aliceLink, nil,
+		harness.aliceRestore,
 	)
 
 	linkErrors := make(chan LinkFailureError, 1)
@@ -6646,14 +7040,15 @@ func TestPipelineSettle(t *testing.T) {
 	// settle.
 	alice.coreLink.cfg.HodlMask = hodl.Mask(hodl.ExitSettle)
 
-	err = start()
+	err = harness.start()
 	require.NoError(t, err)
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  alice.link,
-		bobChannel: bobChannel,
-		aliceMsgs:  alice.msgs,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   alice.link,
+		bobChannel:  harness.bobChannel,
+		aliceMsgs:   alice.msgs,
 	}
 
 	// First lock in an HTLC from Bob to Alice.
@@ -6804,13 +7199,13 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 
 	const chanAmt = btcutil.SatoshiPerBitcoin * 5
 
-	aliceLink, bobChannel, batchTicker, start, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, chanAmt, 0)
 	require.NoError(t, err, "unable to create link")
 
-	require.NoError(t, start())
+	require.NoError(t, harness.start())
 
-	coreLink, ok := aliceLink.(*channelLink)
+	coreLink, ok := harness.aliceLink.(*channelLink)
 	require.True(t, ok)
 
 	mockPeer, ok := coreLink.cfg.Peer.(*mockPeer)
@@ -6830,10 +7225,11 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 	}
 
 	ctx := linkTestContext{
-		t:          t,
-		aliceLink:  aliceLink,
-		aliceMsgs:  aliceMsgs,
-		bobChannel: bobChannel,
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		aliceMsgs:   aliceMsgs,
+		bobChannel:  harness.bobChannel,
 	}
 
 	// Send and lock in htlc from Alice to Bob.
@@ -6843,7 +7239,7 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 	ctx.sendHtlcAliceToBob(htlcID, htlc)
 	ctx.receiveHtlcAliceToBob()
 
-	batchTicker <- time.Now()
+	harness.aliceBatchTicker <- time.Now()
 
 	ctx.receiveCommitSigAliceToBob(1)
 	ctx.sendRevAndAckBobToAlice()
@@ -6854,10 +7250,10 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 	// Return a short htlc failure from Bob to Alice and lock in.
 	shortReason := make([]byte, 260)
 
-	err = bobChannel.FailHTLC(0, shortReason, nil, nil, nil)
+	err = harness.bobChannel.FailHTLC(0, shortReason, nil, nil, nil)
 	require.NoError(t, err)
 
-	aliceLink.HandleChannelUpdate(&lnwire.UpdateFailHTLC{
+	harness.aliceLink.HandleChannelUpdate(&lnwire.UpdateFailHTLC{
 		ID:     htlcID,
 		Reason: shortReason,
 	})
@@ -6881,7 +7277,7 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 	require.Len(t, htlcFailMsg.Reason, 292)
 
 	// Stop the link
-	aliceLink.Stop()
+	harness.aliceLink.Stop()
 
 	// Check that no unexpected messages were sent.
 	select {
@@ -6893,4 +7289,213 @@ func TestChannelLinkShortFailureRelay(t *testing.T) {
 
 	default:
 	}
+}
+
+// TestLinkFlushApiDirectionIsolation tests whether the calls to EnableAdds and
+// DisableAdds are correctly isolated based off of direction (Incoming and
+// Outgoing). This means that the state of the Outgoing flush should always be
+// unaffected by calls to EnableAdds/DisableAdds on the Incoming direction and
+// vice-versa.
+func TestLinkFlushApiDirectionIsolation(t *testing.T) {
+	harness, _ :=
+		newSingleLinkTestHarness(
+			t, 5*btcutil.SatoshiPerBitcoin,
+			1*btcutil.SatoshiPerBitcoin,
+		)
+	aliceLink := harness.aliceLink
+
+	for i := 0; i < 10; i++ {
+		if prand.Uint64()%2 == 0 {
+			aliceLink.EnableAdds(Outgoing)
+			require.False(t, aliceLink.IsFlushing(Outgoing))
+		} else {
+			aliceLink.DisableAdds(Outgoing)
+			require.True(t, aliceLink.IsFlushing(Outgoing))
+		}
+		require.False(t, aliceLink.IsFlushing(Incoming))
+	}
+
+	aliceLink.EnableAdds(Outgoing)
+
+	for i := 0; i < 10; i++ {
+		if prand.Uint64()%2 == 0 {
+			aliceLink.EnableAdds(Incoming)
+			require.False(t, aliceLink.IsFlushing(Incoming))
+		} else {
+			aliceLink.DisableAdds(Incoming)
+			require.True(t, aliceLink.IsFlushing(Incoming))
+		}
+		require.False(t, aliceLink.IsFlushing(Outgoing))
+	}
+}
+
+// TestLinkFlushApiGateStateIdempotence tests whether successive calls to
+// EnableAdds or DisableAdds (without the other one in between) result in both
+// no state change in the flush state AND that the second call results in an
+// error (to inform the caller that the call was unnecessary in case it implies
+// a bug in their logic).
+func TestLinkFlushApiGateStateIdempotence(t *testing.T) {
+	harness, _ :=
+		newSingleLinkTestHarness(
+			t, 5*btcutil.SatoshiPerBitcoin,
+			1*btcutil.SatoshiPerBitcoin,
+		)
+	aliceLink := harness.aliceLink
+
+	for _, dir := range []LinkDirection{Incoming, Outgoing} {
+		require.True(t, aliceLink.DisableAdds(dir))
+		require.True(t, aliceLink.IsFlushing(dir))
+
+		require.False(t, aliceLink.DisableAdds(dir))
+		require.True(t, aliceLink.IsFlushing(dir))
+
+		require.True(t, aliceLink.EnableAdds(dir))
+		require.False(t, aliceLink.IsFlushing(dir))
+
+		require.False(t, aliceLink.EnableAdds(dir))
+		require.False(t, aliceLink.IsFlushing(dir))
+	}
+}
+
+func TestLinkOutgoingCommitHooksCalled(t *testing.T) {
+	harness, err :=
+		newSingleLinkTestHarness(
+			t, 5*btcutil.SatoshiPerBitcoin,
+			btcutil.SatoshiPerBitcoin,
+		)
+	require.NoError(t, err)
+
+	require.NoError(t, harness.start(), "could not start link")
+
+	hookCalled := make(chan struct{})
+
+	var (
+		//nolint:forcetypeassert
+		coreLink = harness.aliceLink.(*channelLink)
+		//nolint:forcetypeassert
+		aliceMsgs = coreLink.cfg.Peer.(*mockPeer).sentMsgs
+	)
+
+	ctx := linkTestContext{
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		bobChannel:  harness.bobChannel,
+		aliceMsgs:   aliceMsgs,
+	}
+
+	// Set up a pending HTLC on the link.
+	//nolint:forcetypeassert
+	htlc := generateHtlc(t, harness.aliceLink.(*channelLink), 0)
+	ctx.sendHtlcAliceToBob(0, htlc)
+	ctx.receiveHtlcAliceToBob()
+
+	harness.aliceLink.OnCommitOnce(Outgoing, func() {
+		close(hookCalled)
+	})
+
+	select {
+	case <-hookCalled:
+		t.Fatal("hook called prematurely")
+	case <-time.NewTimer(time.Second).C:
+	}
+
+	harness.aliceBatchTicker <- time.Now()
+
+	// Send a second tick just to ensure the hook isn't called more than
+	// once.
+	harness.aliceBatchTicker <- time.Now()
+
+	select {
+	case <-hookCalled:
+	case <-time.NewTimer(time.Second).C:
+		t.Fatal("hook not called")
+	}
+}
+
+func TestLinkFlushHooksCalled(t *testing.T) {
+	harness, err :=
+		newSingleLinkTestHarness(
+			t, 5*btcutil.SatoshiPerBitcoin,
+			btcutil.SatoshiPerBitcoin,
+		)
+	require.NoError(t, err)
+
+	require.NoError(t, harness.start(), "could not start link")
+
+	//nolint:forcetypeassert
+	coreLink := harness.aliceLink.(*channelLink)
+	//nolint:forcetypeassert
+	aliceMsgs := coreLink.cfg.Peer.(*mockPeer).sentMsgs
+
+	ctx := linkTestContext{
+		t:           t,
+		aliceSwitch: harness.aliceSwitch,
+		aliceLink:   harness.aliceLink,
+		bobChannel:  harness.bobChannel,
+		aliceMsgs:   aliceMsgs,
+	}
+
+	hookCalled := make(chan struct{})
+
+	assertHookCalled := func(shouldBeCalled bool) {
+		select {
+		case <-hookCalled:
+			require.True(
+				t, shouldBeCalled, "hook called prematurely",
+			)
+		case <-time.NewTimer(time.Millisecond).C:
+			require.False(t, shouldBeCalled, "hook not called")
+		}
+	}
+
+	//nolint:forcetypeassert
+	htlc := generateHtlc(t, harness.aliceLink.(*channelLink), 0)
+
+	// A <- add -- B
+	ctx.sendHtlcBobToAlice(htlc)
+
+	// A <- sig -- B
+	ctx.sendCommitSigBobToAlice(1)
+
+	// A -- rev -> B
+	ctx.receiveRevAndAckAliceToBob()
+
+	// Register flush hook
+	harness.aliceLink.OnFlushedOnce(func() {
+		close(hookCalled)
+	})
+
+	// Channel is not clean, hook should not be called
+	assertHookCalled(false)
+
+	// A -- sig -> B
+	ctx.receiveCommitSigAliceToBob(1)
+	assertHookCalled(false)
+
+	// A <- rev -- B
+	ctx.sendRevAndAckBobToAlice()
+	assertHookCalled(false)
+
+	// A -- set -> B
+	ctx.receiveSettleAliceToBob()
+	assertHookCalled(false)
+
+	// A -- sig -> B
+	ctx.receiveCommitSigAliceToBob(0)
+	assertHookCalled(false)
+
+	// A <- rev -- B
+	ctx.sendRevAndAckBobToAlice()
+	assertHookCalled(false)
+
+	// A <- sig -- B
+	ctx.sendCommitSigBobToAlice(0)
+	// since there is no pause point between alice receiving CommitSig and
+	// sending RevokeAndAck, we don't assert the hook hasn't been called
+	// here.
+
+	// A -- rev -> B
+	ctx.receiveRevAndAckAliceToBob()
+	assertHookCalled(true)
 }

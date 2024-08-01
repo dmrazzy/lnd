@@ -10,10 +10,14 @@ type PendingSweep struct {
 	AmountSat            uint32   `json:"amount_sat"`
 	SatPerVByte          uint32   `json:"sat_per_vbyte"`
 	BroadcastAttempts    uint32   `json:"broadcast_attempts"`
-	NextBroadcastHeight  uint32   `json:"next_broadcast_height"`
 	RequestedSatPerVByte uint32   `json:"requested_sat_per_vbyte"`
-	RequestedConfTarget  uint32   `json:"requested_conf_target"`
-	Force                bool     `json:"force"`
+	Immediate            bool     `json:"immediate"`
+	Budget               uint64   `json:"budget"`
+	DeadlineHeight       uint32   `json:"deadline_height"`
+
+	NextBroadcastHeight uint32 `json:"next_broadcast_height"`
+	RequestedConfTarget uint32 `json:"requested_conf_target"`
+	Force               bool   `json:"force"`
 }
 
 // NewPendingSweepFromProto converts the walletrpc.PendingSweep proto type into
@@ -25,9 +29,14 @@ func NewPendingSweepFromProto(pendingSweep *walletrpc.PendingSweep) *PendingSwee
 		AmountSat:            pendingSweep.AmountSat,
 		SatPerVByte:          uint32(pendingSweep.SatPerVbyte),
 		BroadcastAttempts:    pendingSweep.BroadcastAttempts,
-		NextBroadcastHeight:  pendingSweep.NextBroadcastHeight,
 		RequestedSatPerVByte: uint32(pendingSweep.RequestedSatPerVbyte),
-		RequestedConfTarget:  pendingSweep.RequestedConfTarget,
-		Force:                pendingSweep.Force,
+		Immediate:            pendingSweep.Immediate,
+		Budget:               pendingSweep.Budget,
+		DeadlineHeight:       pendingSweep.DeadlineHeight,
+
+		// Deprecated fields.
+		NextBroadcastHeight: pendingSweep.NextBroadcastHeight,
+		RequestedConfTarget: pendingSweep.RequestedConfTarget,
+		Force:               pendingSweep.Force,
 	}
 }

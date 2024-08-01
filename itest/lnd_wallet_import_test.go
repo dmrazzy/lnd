@@ -372,7 +372,7 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 		)
 
 		block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
-		ht.Miner.AssertTxInBlock(block, txHash)
+		ht.AssertTxInBlock(block, txHash)
 
 		confBalanceAfterChan += chanChangeUtxoAmt
 		ht.AssertWalletAccountBalance(srcNode, account, 0, 0)
@@ -389,7 +389,7 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 		)
 
 		block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
-		ht.Miner.AssertTxInBlock(block, txHash)
+		ht.AssertTxInBlock(block, txHash)
 
 		confBalanceAfterChan += chanChangeUtxoAmt
 		ht.AssertWalletAccountBalance(
@@ -425,15 +425,6 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 	resp := destNode.RPC.AddInvoice(invoice)
 
 	ht.CompletePaymentRequests(srcNode, []string{resp.PaymentRequest})
-
-	// TODO(yy): remove the sleep once the following bug is fixed. When the
-	// payment is reported as settled by srcNode, it's expected the
-	// commitment dance is finished and all subsequent states have been
-	// updated. Yet we'd receive the error `cannot co-op close channel with
-	// active htlcs` or `link failed to shutdown` if we close the channel.
-	// We need to investigate the order of settling the payments and
-	// updating commitments to understand and fix .
-	time.Sleep(2 * time.Second)
 
 	// Now that we've confirmed the opened channel works, we'll close it.
 	ht.CloseChannel(srcNode, chanPoint)

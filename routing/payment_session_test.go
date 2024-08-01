@@ -115,13 +115,11 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 
 	// Create the paymentsession.
 	session, err := newPaymentSession(
-		payment,
-		func(routingGraph) (bandwidthHints, error) {
+		payment, route.Vertex{},
+		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		func() (routingGraph, func(), error) {
-			return &sessionGraph{}, func() {}, nil
-		},
+		newMockGraphSessionFactory(&sessionGraph{}),
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -138,7 +136,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 	require.Equal(t, 1, len(policies), "should have 1 edge policy")
 
 	// Check that the policy has been created as expected.
-	policy := policies[0]
+	policy := policies[0].EdgePolicy()
 	require.Equal(t, testChannelID, policy.ChannelID, "channel ID mismatch")
 	require.Equal(t,
 		oldExpiryDelta, policy.TimeLockDelta, "timelock delta mismatch",
@@ -195,13 +193,11 @@ func TestRequestRoute(t *testing.T) {
 	}
 
 	session, err := newPaymentSession(
-		payment,
-		func(routingGraph) (bandwidthHints, error) {
+		payment, route.Vertex{},
+		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		func() (routingGraph, func(), error) {
-			return &sessionGraph{}, func() {}, nil
-		},
+		newMockGraphSessionFactory(&sessionGraph{}),
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -211,9 +207,9 @@ func TestRequestRoute(t *testing.T) {
 
 	// Override pathfinder with a mock.
 	session.pathFinder = func(_ *graphParams, r *RestrictParams,
-		_ *PathFindingConfig, _, _ route.Vertex, _ lnwire.MilliSatoshi,
-		_ float64, _ int32) ([]*models.CachedEdgePolicy, float64,
-		error) {
+		_ *PathFindingConfig, _, _, _ route.Vertex,
+		_ lnwire.MilliSatoshi, _ float64, _ int32) ([]*unifiedEdge,
+		float64, error) {
 
 		// We expect find path to receive a cltv limit excluding the
 		// final cltv delta (including the block padding).
@@ -221,14 +217,16 @@ func TestRequestRoute(t *testing.T) {
 			t.Fatal("wrong cltv limit")
 		}
 
-		path := []*models.CachedEdgePolicy{
+		path := []*unifiedEdge{
 			{
-				ToNodePubKey: func() route.Vertex {
-					return route.Vertex{}
+				policy: &models.CachedEdgePolicy{
+					ToNodePubKey: func() route.Vertex {
+						return route.Vertex{}
+					},
+					ToNodeFeatures: lnwire.NewFeatureVector(
+						nil, nil,
+					),
 				},
-				ToNodeFeatures: lnwire.NewFeatureVector(
-					nil, nil,
-				),
 			},
 		}
 
@@ -251,7 +249,7 @@ func TestRequestRoute(t *testing.T) {
 }
 
 type sessionGraph struct {
-	routingGraph
+	Graph
 }
 
 func (g *sessionGraph) sourceNode() route.Vertex {

@@ -181,12 +181,12 @@ func parseOutPoint(s string) (*wire.OutPoint, error) {
 
 	index, err := strconv.ParseInt(split[1], 10, 32)
 	if err != nil {
-		return nil, fmt.Errorf("unable to decode output index: %v", err)
+		return nil, fmt.Errorf("unable to decode output index: %w", err)
 	}
 
 	txid, err := chainhash.NewHashFromStr(split[0])
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse hex string: %v", err)
+		return nil, fmt.Errorf("unable to parse hex string: %w", err)
 	}
 
 	return &wire.OutPoint{
@@ -252,7 +252,7 @@ func (s *Server) ImportGraph(ctx context.Context,
 		}
 
 		if err := graphDB.AddLightningNode(node); err != nil {
-			return nil, fmt.Errorf("unable to add node %v: %v",
+			return nil, fmt.Errorf("unable to add node %v: %w",
 				rpcNode.PubKey, err)
 		}
 
@@ -285,7 +285,7 @@ func (s *Server) ImportGraph(ctx context.Context,
 		edge.ChannelPoint = *channelPoint
 
 		if err := graphDB.AddChannelEdge(edge); err != nil {
-			return nil, fmt.Errorf("unable to add edge %v: %v",
+			return nil, fmt.Errorf("unable to add edge %v: %w",
 				rpcEdge.ChanPoint, err)
 		}
 

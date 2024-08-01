@@ -104,7 +104,7 @@ var (
 )
 
 var (
-	// ErrNoSequenceNumber is returned if we lookup a payment which does
+	// ErrNoSequenceNumber is returned if we look up a payment which does
 	// not have a sequence number.
 	ErrNoSequenceNumber = errors.New("sequence number not found")
 
@@ -147,18 +147,20 @@ const (
 	// balance to complete the payment.
 	FailureReasonInsufficientBalance FailureReason = 4
 
-	// TODO(halseth): cancel state.
+	// FailureReasonCanceled indicates that the payment was canceled by the
+	// user.
+	FailureReasonCanceled FailureReason = 5
 
 	// TODO(joostjager): Add failure reasons for:
 	// LocalLiquidityInsufficient, RemoteCapacityInsufficient.
 )
 
-// Error returns a human readable error string for the FailureReason.
+// Error returns a human-readable error string for the FailureReason.
 func (r FailureReason) Error() string {
 	return r.String()
 }
 
-// String returns a human readable FailureReason.
+// String returns a human-readable FailureReason.
 func (r FailureReason) String() string {
 	switch r {
 	case FailureReasonTimeout:
@@ -171,6 +173,8 @@ func (r FailureReason) String() string {
 		return "incorrect_payment_details"
 	case FailureReasonInsufficientBalance:
 		return "insufficient_balance"
+	case FailureReasonCanceled:
+		return "canceled"
 	}
 
 	return "unknown"
@@ -471,13 +475,13 @@ type PaymentsQuery struct {
 	// payment index (complete and incomplete) should be counted.
 	CountTotal bool
 
-	// CreationDateStart, if set, filters out all payments with a creation
-	// date greater than or euqal to it.
-	CreationDateStart time.Time
+	// CreationDateStart, expressed in Unix seconds, if set, filters out
+	// all payments with a creation date greater than or equal to it.
+	CreationDateStart int64
 
-	// CreationDateEnd, if set, filters out all payments with a creation
-	// date less than or euqal to it.
-	CreationDateEnd time.Time
+	// CreationDateEnd, expressed in Unix seconds, if set, filters out all
+	// payments with a creation date less than or equal to it.
+	CreationDateEnd int64
 }
 
 // PaymentsResponse contains the result of a query to the payments database.
@@ -512,11 +516,7 @@ type PaymentsResponse struct {
 // to a subset of payments by the payments query, containing an offset
 // index and a maximum number of returned payments.
 func (d *DB) QueryPayments(query PaymentsQuery) (PaymentsResponse, error) {
-	var (
-		resp         PaymentsResponse
-		startDateSet = !query.CreationDateStart.IsZero()
-		endDateSet   = !query.CreationDateEnd.IsZero()
-	)
+	var resp PaymentsResponse
 
 	if err := kvdb.View(d, func(tx kvdb.RTx) error {
 		// Get the root payments bucket.
@@ -561,20 +561,20 @@ func (d *DB) QueryPayments(query PaymentsQuery) (PaymentsResponse, error) {
 				return false, err
 			}
 
+			// Get the creation time in Unix seconds, this always
+			// rounds down the nanoseconds to full seconds.
+			createTime := payment.Info.CreationTime.Unix()
+
 			// Skip any payments that were created before the
 			// specified time.
-			if startDateSet && payment.Info.CreationTime.Before(
-				query.CreationDateStart,
-			) {
-
+			if createTime < query.CreationDateStart {
 				return false, nil
 			}
 
 			// Skip any payments that were created after the
 			// specified time.
-			if endDateSet && payment.Info.CreationTime.After(
-				query.CreationDateEnd,
-			) {
+			if query.CreationDateEnd != 0 &&
+				createTime > query.CreationDateEnd {
 
 				return false, nil
 			}
@@ -619,7 +619,7 @@ func (d *DB) QueryPayments(query PaymentsQuery) (PaymentsResponse, error) {
 				err = indexes.ForEach(countFn)
 			}
 			if err != nil {
-				return fmt.Errorf("error counting payments: %v",
+				return fmt.Errorf("error counting payments: %w",
 					err)
 			}
 
@@ -1157,6 +1157,10 @@ func serializeHop(w io.Writer, h *route.Hop) error {
 		))
 	}
 
+	if h.AMP != nil {
+		records = append(records, h.AMP.Record())
+	}
+
 	if h.Metadata != nil {
 		records = append(records, record.NewMetadataRecord(&h.Metadata))
 	}
@@ -1301,7 +1305,23 @@ func deserializeHop(r io.Reader) (*route.Hop, error) {
 		}
 	}
 
-	// If the metatdata type is present, remove it from the tlv map and
+	ampType := uint64(record.AMPOnionType)
+	if ampBytes, ok := tlvMap[ampType]; ok {
+		delete(tlvMap, ampType)
+
+		var (
+			amp    = &record.AMP{}
+			ampRec = amp.Record()
+			r      = bytes.NewReader(ampBytes)
+		)
+		err := ampRec.Decode(r, uint64(len(ampBytes)))
+		if err != nil {
+			return nil, err
+		}
+		h.AMP = amp
+	}
+
+	// If the metadata type is present, remove it from the tlv map and
 	// populate directly on the hop.
 	metadataType := uint64(record.MetadataOnionType)
 	if metadata, ok := tlvMap[metadataType]; ok {

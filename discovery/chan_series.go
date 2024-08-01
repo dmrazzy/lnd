@@ -5,9 +5,9 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/netann"
-	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
@@ -37,14 +37,16 @@ type ChannelGraphTimeSeries interface {
 	// ID's represents the ID's that we don't know of which were in the
 	// passed superSet.
 	FilterKnownChanIDs(chain chainhash.Hash,
-		superSet []lnwire.ShortChannelID) ([]lnwire.ShortChannelID, error)
+		superSet []channeldb.ChannelUpdateInfo,
+		isZombieChan func(time.Time, time.Time) bool) (
+		[]lnwire.ShortChannelID, error)
 
 	// FilterChannelRange returns the set of channels that we created
 	// between the start height and the end height. The channel IDs are
 	// grouped by their common block height. We'll use this to to a remote
 	// peer's QueryChannelRange message.
-	FilterChannelRange(chain chainhash.Hash,
-		startHeight, endHeight uint32) ([]channeldb.BlockChannelRange, error)
+	FilterChannelRange(chain chainhash.Hash, startHeight, endHeight uint32,
+		withTimestamps bool) ([]channeldb.BlockChannelRange, error)
 
 	// FetchChanAnns returns a full set of channel announcements as well as
 	// their updates that match the set of specified short channel ID's.
@@ -134,7 +136,7 @@ func (c *ChanSeries) UpdatesInHorizon(chain chainhash.Hash,
 		if edge1 != nil {
 			// We don't want to send channel updates that don't
 			// conform to the spec (anymore).
-			err := routing.ValidateChannelUpdateFields(0, edge1)
+			err := graph.ValidateChannelUpdateFields(0, edge1)
 			if err != nil {
 				log.Errorf("not sending invalid channel "+
 					"update %v: %v", edge1, err)
@@ -143,7 +145,7 @@ func (c *ChanSeries) UpdatesInHorizon(chain chainhash.Hash,
 			}
 		}
 		if edge2 != nil {
-			err := routing.ValidateChannelUpdateFields(0, edge2)
+			err := graph.ValidateChannelUpdateFields(0, edge2)
 			if err != nil {
 				log.Errorf("not sending invalid channel "+
 					"update %v: %v", edge2, err)
@@ -197,15 +199,12 @@ func (c *ChanSeries) UpdatesInHorizon(chain chainhash.Hash,
 // represents the ID's that we don't know of which were in the passed superSet.
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
-func (c *ChanSeries) FilterKnownChanIDs(chain chainhash.Hash,
-	superSet []lnwire.ShortChannelID) ([]lnwire.ShortChannelID, error) {
+func (c *ChanSeries) FilterKnownChanIDs(_ chainhash.Hash,
+	superSet []channeldb.ChannelUpdateInfo,
+	isZombieChan func(time.Time, time.Time) bool) (
+	[]lnwire.ShortChannelID, error) {
 
-	chanIDs := make([]uint64, 0, len(superSet))
-	for _, chanID := range superSet {
-		chanIDs = append(chanIDs, chanID.ToUint64())
-	}
-
-	newChanIDs, err := c.graph.FilterKnownChanIDs(chanIDs)
+	newChanIDs, err := c.graph.FilterKnownChanIDs(superSet, isZombieChan)
 	if err != nil {
 		return nil, err
 	}
@@ -226,10 +225,13 @@ func (c *ChanSeries) FilterKnownChanIDs(chain chainhash.Hash,
 // message.
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
-func (c *ChanSeries) FilterChannelRange(chain chainhash.Hash,
-	startHeight, endHeight uint32) ([]channeldb.BlockChannelRange, error) {
+func (c *ChanSeries) FilterChannelRange(_ chainhash.Hash, startHeight,
+	endHeight uint32, withTimestamps bool) ([]channeldb.BlockChannelRange,
+	error) {
 
-	return c.graph.FilterChannelRange(startHeight, endHeight)
+	return c.graph.FilterChannelRange(
+		startHeight, endHeight, withTimestamps,
+	)
 }
 
 // FetchChanAnns returns a full set of channel announcements as well as their

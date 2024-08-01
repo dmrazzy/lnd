@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
@@ -81,6 +80,7 @@ const (
 	CodeExpiryTooFar                     FailCode = 21
 	CodeInvalidOnionPayload                       = FlagPerm | 22
 	CodeMPPTimeout                       FailCode = 23
+	CodeInvalidBlinding                           = FlagBadOnion | FlagPerm | 24 //nolint:lll
 )
 
 // String returns the string representation of the failure code.
@@ -157,6 +157,9 @@ func (c FailCode) String() string {
 
 	case CodeMPPTimeout:
 		return "MPPTimeout"
+
+	case CodeInvalidBlinding:
+		return "InvalidBlinding"
 
 	default:
 		return "<unknown>"
@@ -1233,6 +1236,51 @@ func (f *FailMPPTimeout) Error() string {
 	return f.Code().String()
 }
 
+// FailInvalidBlinding is returned if there has been a route blinding related
+// error.
+type FailInvalidBlinding struct {
+	OnionSHA256 [sha256.Size]byte
+}
+
+// Code returns the failure unique code.
+//
+// NOTE: Part of the FailureMessage interface.
+func (f *FailInvalidBlinding) Code() FailCode {
+	return CodeInvalidBlinding
+}
+
+// Returns a human readable string describing the target FailureMessage.
+//
+// NOTE: Implements the error interface.
+func (f *FailInvalidBlinding) Error() string {
+	return f.Code().String()
+}
+
+// Decode decodes the failure from bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *FailInvalidBlinding) Decode(r io.Reader, _ uint32) error {
+	return ReadElement(r, f.OnionSHA256[:])
+}
+
+// Encode writes the failure in bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *FailInvalidBlinding) Encode(w *bytes.Buffer, _ uint32) error {
+	return WriteBytes(w, f.OnionSHA256[:])
+}
+
+// NewInvalidBlinding creates new instance of FailInvalidBlinding.
+func NewInvalidBlinding(onion []byte) *FailInvalidBlinding {
+	// The spec allows empty onion hashes for invalid blinding, so we only
+	// include our onion hash if it's provided.
+	if onion == nil {
+		return &FailInvalidBlinding{}
+	}
+
+	return &FailInvalidBlinding{OnionSHA256: sha256.Sum256(onion)}
+}
+
 // DecodeFailure decodes, validates, and parses the lnwire onion failure, for
 // the provided protocol version.
 func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
@@ -1255,7 +1303,7 @@ func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
 		return nil, fmt.Errorf("unable to read pad len: %w", err)
 	}
 
-	if _, err := io.CopyN(ioutil.Discard, r, int64(padLength)); err != nil {
+	if _, err := io.CopyN(io.Discard, r, int64(padLength)); err != nil {
 		return nil, fmt.Errorf("unable to read padding %w", err)
 	}
 
@@ -1287,7 +1335,7 @@ func DecodeFailureMessage(r io.Reader, pver uint32) (FailureMessage, error) {
 	// the first two bytes of the buffer.
 	var codeBytes [2]byte
 	if _, err := io.ReadFull(r, codeBytes[:]); err != nil {
-		return nil, fmt.Errorf("unable to read failure code: %v", err)
+		return nil, fmt.Errorf("unable to read failure code: %w", err)
 	}
 	failCode := FailCode(binary.BigEndian.Uint16(codeBytes[:]))
 
@@ -1295,7 +1343,7 @@ func DecodeFailureMessage(r io.Reader, pver uint32) (FailureMessage, error) {
 	// additional data if needed.
 	failure, err := makeEmptyOnionError(failCode)
 	if err != nil {
-		return nil, fmt.Errorf("unable to make empty error: %v", err)
+		return nil, fmt.Errorf("unable to make empty error: %w", err)
 	}
 
 	// Finally, if this failure has a payload, then we'll read that now as
@@ -1450,6 +1498,9 @@ func makeEmptyOnionError(code FailCode) (FailureMessage, error) {
 
 	case CodeMPPTimeout:
 		return &FailMPPTimeout{}, nil
+
+	case CodeInvalidBlinding:
+		return &FailInvalidBlinding{}, nil
 
 	default:
 		return nil, errors.Errorf("unknown error code: %v", code)

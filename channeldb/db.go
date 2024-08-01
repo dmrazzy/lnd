@@ -497,7 +497,7 @@ func initChannelDB(db kvdb.Backend) error {
 		return putMeta(meta, tx)
 	}, func() {})
 	if err != nil {
-		return fmt.Errorf("unable to create new channeldb: %v", err)
+		return fmt.Errorf("unable to create new channeldb: %w", err)
 	}
 
 	return nil
@@ -643,7 +643,7 @@ func (c *ChannelStateDB) fetchNodeChannels(chainBucket kvdb.RBucket) (
 		oChannel, err := fetchOpenChannel(chanBucket, &outPoint)
 		if err != nil {
 			return fmt.Errorf("unable to read channel data for "+
-				"chan_point=%v: %v", outPoint, err)
+				"chan_point=%v: %w", outPoint, err)
 		}
 		oChannel.Db = c
 
@@ -704,7 +704,7 @@ func (c *ChannelStateDB) FetchChannelByID(tx kvdb.RTx, id lnwire.ChannelID) (
 				return err
 			}
 
-			chanID := lnwire.NewChanIDFromOutPoint(&outPoint)
+			chanID := lnwire.NewChanIDFromOutPoint(outPoint)
 			if chanID != id {
 				return nil
 			}
@@ -1351,7 +1351,7 @@ func (d *DB) AddrsForNode(nodePub *btcec.PublicKey) ([]net.Addr,
 	if err != nil {
 		return nil, err
 	}
-	graphNode, err := d.graph.FetchLightningNode(nil, pubKey)
+	graphNode, err := d.graph.FetchLightningNode(pubKey)
 	if err != nil && err != ErrGraphNodeNotFound {
 		return nil, err
 	} else if err == ErrGraphNodeNotFound {

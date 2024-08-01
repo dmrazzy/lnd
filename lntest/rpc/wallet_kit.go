@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 
+	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/stretchr/testify/require"
@@ -65,6 +66,16 @@ func (h *HarnessRPC) FundPsbt(
 	h.NoError(err, "FundPsbt")
 
 	return resp
+}
+
+// FundPsbtAssertErr makes a RPC call to the node's FundPsbt and asserts an
+// error is returned.
+func (h *HarnessRPC) FundPsbtAssertErr(req *walletrpc.FundPsbtRequest) {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.WalletKit.FundPsbt(ctxt, req)
+	require.Error(h, err, "expected error returned")
 }
 
 // FinalizePsbt makes a RPC call to node's FinalizePsbt and asserts.
@@ -158,11 +169,16 @@ func (h *HarnessRPC) VerifyMessageWithAddr(
 }
 
 // ListSweeps makes a ListSweeps RPC call to the node's WalletKit client.
-func (h *HarnessRPC) ListSweeps(verbose bool) *walletrpc.ListSweepsResponse {
+func (h *HarnessRPC) ListSweeps(verbose bool,
+	startHeight int32) *walletrpc.ListSweepsResponse {
+
 	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
 	defer cancel()
 
-	req := &walletrpc.ListSweepsRequest{Verbose: verbose}
+	req := &walletrpc.ListSweepsRequest{
+		Verbose:     verbose,
+		StartHeight: startHeight,
+	}
 	resp, err := h.WalletKit.ListSweeps(ctxt, req)
 	h.NoError(err, "ListSweeps")
 
@@ -192,6 +208,35 @@ func (h *HarnessRPC) PublishTransaction(
 
 	resp, err := h.WalletKit.PublishTransaction(ctxt, req)
 	h.NoError(err, "PublishTransaction")
+
+	return resp
+}
+
+// GetTransaction makes a RPC call to the node's WalletKitClient and asserts.
+func (h *HarnessRPC) GetTransaction(
+	req *walletrpc.GetTransactionRequest) *lnrpc.Transaction {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.WalletKit.GetTransaction(ctxt, req)
+	h.NoError(err, "GetTransaction")
+
+	return resp
+}
+
+// RemoveTransaction makes an RPC call to the node's WalletKitClient and
+// asserts.
+//
+//nolint:lll
+func (h *HarnessRPC) RemoveTransaction(
+	req *walletrpc.GetTransactionRequest) *walletrpc.RemoveTransactionResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.WalletKit.RemoveTransaction(ctxt, req)
+	h.NoError(err, "RemoveTransaction")
 
 	return resp
 }

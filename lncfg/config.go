@@ -5,6 +5,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -67,6 +68,10 @@ const (
 	// peer and a block arriving during that round trip to trigger force
 	// closure.
 	DefaultOutgoingCltvRejectDelta = DefaultOutgoingBroadcastDelta + 3
+
+	// DefaultZombieSweeperInterval is the default time interval at which
+	// unfinished (zombiestate) open channel flows are purged from memory.
+	DefaultZombieSweeperInterval = 1 * time.Minute
 )
 
 // CleanAndExpandPath expands environment variables and leading ~ in the

@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -25,6 +24,7 @@ import (
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/cluster"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -57,6 +57,14 @@ const (
 	// admin macaroon unless the administrator explicitly allowed it. Thus
 	// there's no harm allowing group read.
 	adminMacaroonFilePermissions = 0640
+
+	// leaderResignTimeout is the timeout used when resigning from the
+	// leader role. This is kept short so LND can shut down quickly in case
+	// of a system failure or network partition making the cluster
+	// unresponsive. The cluster itself should ensure that the leader is not
+	// elected again until the previous leader has resigned or the leader
+	// election timeout has passed.
+	leaderResignTimeout = 5 * time.Second
 )
 
 // AdminAuthOptions returns a list of DialOptions that can be used to
@@ -72,7 +80,7 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 
 	creds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
 	if err != nil {
-		return nil, fmt.Errorf("unable to read TLS cert: %v", err)
+		return nil, fmt.Errorf("unable to read TLS cert: %w", err)
 	}
 
 	// Create a dial options array.
@@ -83,7 +91,7 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 	// Get the admin macaroon if macaroons are active.
 	if !skipMacaroons && !cfg.NoMacaroons {
 		// Load the admin macaroon file.
-		macBytes, err := ioutil.ReadFile(cfg.AdminMacPath)
+		macBytes, err := os.ReadFile(cfg.AdminMacPath)
 		if err != nil {
 			return nil, fmt.Errorf("unable to read macaroon "+
 				"path (check the network setting!): %v", err)
@@ -91,14 +99,14 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 
 		mac := &macaroon.Macaroon{}
 		if err = mac.UnmarshalBinary(macBytes); err != nil {
-			return nil, fmt.Errorf("unable to decode macaroon: %v",
+			return nil, fmt.Errorf("unable to decode macaroon: %w",
 				err)
 		}
 
 		// Now we append the macaroon credentials to the dial options.
 		cred, err := macaroons.NewMacaroonCredential(mac)
 		if err != nil {
-			return nil, fmt.Errorf("error cloning mac: %v", err)
+			return nil, fmt.Errorf("error cloning mac: %w", err)
 		}
 		opts = append(opts, grpc.WithPerRPCCredentials(cred))
 	}
@@ -382,6 +390,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// blocked until this instance is elected as the current leader or
 	// shutting down.
 	elected := false
+	var leaderElector cluster.LeaderElector
 	if cfg.Cluster.EnableLeaderElection {
 		electionCtx, cancelElection := context.WithCancel(ctx)
 
@@ -393,7 +402,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		ltndLog.Infof("Using %v leader elector",
 			cfg.Cluster.LeaderElector)
 
-		leaderElector, err := cfg.Cluster.MakeLeaderElector(
+		leaderElector, err = cfg.Cluster.MakeLeaderElector(
 			electionCtx, cfg.DB,
 		)
 		if err != nil {
@@ -408,7 +417,17 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			ltndLog.Infof("Attempting to resign from leader role "+
 				"(%v)", cfg.Cluster.ID)
 
-			if err := leaderElector.Resign(); err != nil {
+			// Ensure that we don't block the shutdown process if
+			// the leader resigning process takes too long. The
+			// cluster will ensure that the leader is not elected
+			// again until the previous leader has resigned or the
+			// leader election timeout has passed.
+			timeoutCtx, cancel := context.WithTimeout(
+				ctx, leaderResignTimeout,
+			)
+			defer cancel()
+
+			if err := leaderElector.Resign(timeoutCtx); err != nil {
 				ltndLog.Errorf("Leader elector failed to "+
 					"resign: %v", err)
 			}
@@ -580,7 +599,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	server, err := newServer(
 		cfg, cfg.Listeners, dbs, activeChainControl, &idKeyDesc,
 		activeChainControl.Cfg.WalletUnlockParams.ChansToRestore,
-		multiAcceptor, torController, tlsManager,
+		multiAcceptor, torController, tlsManager, leaderElector,
 	)
 	if err != nil {
 		return mkErr("unable to create server: %v", err)
@@ -675,11 +694,33 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		bestHeight)
 
 	// With all the relevant chains initialized, we can finally start the
-	// server itself.
-	if err := server.Start(); err != nil {
+	// server itself. We start the server in an asynchronous goroutine so
+	// that we are able to interrupt and shutdown the daemon gracefully in
+	// case the startup of the subservers do not behave as expected.
+	errChan := make(chan error)
+	go func() {
+		errChan <- server.Start()
+	}()
+
+	defer func() {
+		err := server.Stop()
+		if err != nil {
+			ltndLog.Warnf("Stopping the server including all "+
+				"its subsystems failed with %v", err)
+		}
+	}()
+
+	select {
+	case err := <-errChan:
+		if err == nil {
+			break
+		}
+
 		return mkErr("unable to start server: %v", err)
+
+	case <-interceptor.ShutdownChannel():
+		return nil
 	}
-	defer server.Stop()
 
 	// We transition the server state to Active, as the server is up.
 	interceptorChain.SetServerActive()

@@ -60,6 +60,14 @@ var addInvoiceCommand = cli.Command{
 				"specified, an expiry of " +
 				"86400 seconds (24 hours) is implied.",
 		},
+		cli.Uint64Flag{
+			Name: "cltv_expiry_delta",
+			Usage: "The minimum CLTV delta to use for the final " +
+				"hop. If this is set to 0, the default value " +
+				"is used. The default value for " +
+				"cltv_expiry_delta is configured by the " +
+				"'bitcoin.timelockdelta' option.",
+		},
 		cli.BoolFlag{
 			Name: "private",
 			Usage: "encode routing hints in the invoice with " +
@@ -73,6 +81,14 @@ var addInvoiceCommand = cli.Command{
 			Name: "amp",
 			Usage: "creates an AMP invoice. If true, preimage " +
 				"should not be set.",
+		},
+		cli.BoolFlag{
+			Name: "blind",
+			Usage: "creates an invoice that contains blinded " +
+				"paths. Note that invoices with blinded " +
+				"paths will be signed using a random " +
+				"ephemeral key so as not to reveal the real " +
+				"node ID of this node.",
 		},
 	},
 	Action: actionDecorator(addInvoice),
@@ -98,7 +114,8 @@ func addInvoice(ctx *cli.Context) error {
 		amt, err = strconv.ParseInt(args.First(), 10, 64)
 		args = args.Tail()
 		if err != nil {
-			return fmt.Errorf("unable to decode amt argument: %v", err)
+			return fmt.Errorf("unable to decode amt argument: %w",
+				err)
 		}
 	}
 
@@ -110,12 +127,17 @@ func addInvoice(ctx *cli.Context) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("unable to parse preimage: %v", err)
+		return fmt.Errorf("unable to parse preimage: %w", err)
 	}
 
 	descHash, err = hex.DecodeString(ctx.String("description_hash"))
 	if err != nil {
-		return fmt.Errorf("unable to parse description_hash: %v", err)
+		return fmt.Errorf("unable to parse description_hash: %w", err)
+	}
+
+	if ctx.IsSet("private") && ctx.IsSet("blind") {
+		return fmt.Errorf("cannot include both route hints and " +
+			"blinded paths in the same invoice")
 	}
 
 	invoice := &lnrpc.Invoice{
@@ -126,8 +148,10 @@ func addInvoice(ctx *cli.Context) error {
 		DescriptionHash: descHash,
 		FallbackAddr:    ctx.String("fallback_addr"),
 		Expiry:          ctx.Int64("expiry"),
+		CltvExpiry:      ctx.Uint64("cltv_expiry_delta"),
 		Private:         ctx.Bool("private"),
 		IsAmp:           ctx.Bool("amp"),
+		Blind:           ctx.Bool("blind"),
 	}
 
 	resp, err := client.AddInvoice(ctxc, invoice)
@@ -175,7 +199,7 @@ func lookupInvoice(ctx *cli.Context) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("unable to decode rhash argument: %v", err)
+		return fmt.Errorf("unable to decode rhash argument: %w", err)
 	}
 
 	req := &lnrpc.PaymentHash{

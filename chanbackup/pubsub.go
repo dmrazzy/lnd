@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lnutils"
 )
 
 // Swapper is an interface that allows the chanbackup.SubSwapper to update the
@@ -226,7 +227,7 @@ func (s *SubSwapper) updateBackupFile(closedChans ...wire.OutPoint) error {
 	var b bytes.Buffer
 	err = newMulti.PackToWriter(&b, s.keyRing)
 	if err != nil {
-		return fmt.Errorf("unable to pack multi backup: %v", err)
+		return fmt.Errorf("unable to pack multi backup: %w", err)
 	}
 
 	// Finally, we'll swap out the old backup for this new one in a single
@@ -234,7 +235,7 @@ func (s *SubSwapper) updateBackupFile(closedChans ...wire.OutPoint) error {
 	// channels.
 	err = s.Swapper.UpdateAndSwap(PackedMulti(b.Bytes()))
 	if err != nil {
-		return fmt.Errorf("unable to update multi backup: %v", err)
+		return fmt.Errorf("unable to update multi backup: %w", err)
 	}
 
 	return nil
@@ -278,9 +279,8 @@ func (s *SubSwapper) backupUpdater() {
 			)
 			for i, closedChan := range chanUpdate.ClosedChans {
 				log.Debugf("Removing channel %v from backup "+
-					"state", newLogClosure(func() string {
-					return chanUpdate.ClosedChans[i].String()
-				}))
+					"state", lnutils.NewLogClosure(
+					chanUpdate.ClosedChans[i].String))
 
 				delete(s.backupState, closedChan)
 

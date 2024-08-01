@@ -1,6 +1,7 @@
 package hop
 
 import (
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -22,4 +23,14 @@ type ForwardingInfo struct {
 	// OutgoingCTLV is the specified value of the CTLV timelock to be used
 	// in the outgoing HTLC.
 	OutgoingCTLV uint32
+
+	// NextBlinding is an optional blinding point to be passed to the next
+	// node in UpdateAddHtlc. This field is set if the htlc is part of a
+	// blinded route.
+	NextBlinding lnwire.BlindingPointRecord
+
+	// PathID is a secret identifier that the creator of a blinded path
+	// sets for itself to ensure that the blinded path has been used in the
+	// correct context.
+	PathID *chainhash.Hash
 }

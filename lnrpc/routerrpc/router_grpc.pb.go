@@ -21,7 +21,10 @@ const _ = grpc.SupportPackageIsVersion7
 type RouterClient interface {
 	// SendPaymentV2 attempts to route a payment described by the passed
 	// PaymentRequest to the final destination. The call returns a stream of
-	// payment updates.
+	// payment updates. When using this RPC, make sure to set a fee limit, as the
+	// default routing fee limit is 0 sats. Without a non-zero fee limit only
+	// routes without fees will be attempted which often fails with
+	// FAILURE_REASON_NO_ROUTE.
 	SendPaymentV2(ctx context.Context, in *SendPaymentRequest, opts ...grpc.CallOption) (Router_SendPaymentV2Client, error)
 	// lncli: `trackpayment`
 	// TrackPaymentV2 returns an update stream for the payment identified by the
@@ -81,6 +84,10 @@ type RouterClient interface {
 	// BuildRoute builds a fully specified route based on a list of hop public
 	// keys. It retrieves the relevant channel policies from the graph in order to
 	// calculate the correct fees and time locks.
+	// Note that LND will use its default final_cltv_delta if no value is supplied.
+	// Make sure to add the correct final_cltv_delta depending on the invoice
+	// restriction. Moreover the caller has to make sure to provide the
+	// payment_addr if the route is paying an invoice which signaled it.
 	BuildRoute(ctx context.Context, in *BuildRouteRequest, opts ...grpc.CallOption) (*BuildRouteResponse, error)
 	// SubscribeHtlcEvents creates a uni-directional stream from the server to
 	// the client which delivers a stream of htlc events.
@@ -450,7 +457,10 @@ func (c *routerClient) UpdateChanStatus(ctx context.Context, in *UpdateChanStatu
 type RouterServer interface {
 	// SendPaymentV2 attempts to route a payment described by the passed
 	// PaymentRequest to the final destination. The call returns a stream of
-	// payment updates.
+	// payment updates. When using this RPC, make sure to set a fee limit, as the
+	// default routing fee limit is 0 sats. Without a non-zero fee limit only
+	// routes without fees will be attempted which often fails with
+	// FAILURE_REASON_NO_ROUTE.
 	SendPaymentV2(*SendPaymentRequest, Router_SendPaymentV2Server) error
 	// lncli: `trackpayment`
 	// TrackPaymentV2 returns an update stream for the payment identified by the
@@ -510,6 +520,10 @@ type RouterServer interface {
 	// BuildRoute builds a fully specified route based on a list of hop public
 	// keys. It retrieves the relevant channel policies from the graph in order to
 	// calculate the correct fees and time locks.
+	// Note that LND will use its default final_cltv_delta if no value is supplied.
+	// Make sure to add the correct final_cltv_delta depending on the invoice
+	// restriction. Moreover the caller has to make sure to provide the
+	// payment_addr if the route is paying an invoice which signaled it.
 	BuildRoute(context.Context, *BuildRouteRequest) (*BuildRouteResponse, error)
 	// SubscribeHtlcEvents creates a uni-directional stream from the server to
 	// the client which delivers a stream of htlc events.

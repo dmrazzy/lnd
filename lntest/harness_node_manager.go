@@ -8,11 +8,12 @@ import (
 	"testing"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 )
 
-// nodeManager is responsible for hanlding the start and stop of a given node.
+// nodeManager is responsible for handling the start and stop of a given node.
 // It also keeps track of the running nodes.
 type nodeManager struct {
 	sync.Mutex
@@ -31,6 +32,10 @@ type nodeManager struct {
 	// dbBackend sets the database backend to use.
 	dbBackend node.DatabaseBackend
 
+	// nativeSQL sets the database backend to use native SQL when
+	// applicable.
+	nativeSQL bool
+
 	// activeNodes is a map of all running nodes, format:
 	// {pubkey: *HarnessNode}.
 	activeNodes map[uint32]*node.HarnessNode
@@ -48,12 +53,13 @@ type nodeManager struct {
 }
 
 // newNodeManager creates a new node manager instance.
-func newNodeManager(lndBinary string,
-	dbBackend node.DatabaseBackend) *nodeManager {
+func newNodeManager(lndBinary string, dbBackend node.DatabaseBackend,
+	nativeSQL bool) *nodeManager {
 
 	return &nodeManager{
 		lndBinary:    lndBinary,
 		dbBackend:    dbBackend,
+		nativeSQL:    nativeSQL,
 		activeNodes:  make(map[uint32]*node.HarnessNode),
 		standbyNodes: make(map[uint32]*node.HarnessNode),
 	}
@@ -80,9 +86,10 @@ func (nm *nodeManager) newNode(t *testing.T, name string, extraArgs []string,
 		ExtraArgs:         extraArgs,
 		FeeURL:            nm.feeServiceURL,
 		DBBackend:         nm.dbBackend,
+		NativeSQL:         nm.nativeSQL,
 		NodeID:            nm.nextNodeID(),
 		LndBinary:         nm.lndBinary,
-		NetParams:         harnessNetParams,
+		NetParams:         miner.HarnessNetParams,
 		SkipUnlock:        noAuth,
 	}
 
